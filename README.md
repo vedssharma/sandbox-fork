@@ -62,6 +62,10 @@ effort `medium`, adaptive thinking, prompt caching (branches share the fork-poin
 server-side refusal fallbacks. History is append-only, so every branch stays valid under preserved
 thinking. Forks nest up to `--max-fork-depth` (default 1: branches can't fork again).
 
+The Anthropic SDK honors `ANTHROPIC_BASE_URL`. Some hosted environments (including Claude Code
+cloud sessions) set it for their own use; if requests fail with an auth error there, run with
+`env -u ANTHROPIC_BASE_URL sfork explore ...`.
+
 A task directory holds `task.md` (the prompt), `sandbox-fork.toml` (eval config, see
 `sfork/eval/config.py`) and `repo/` (files seeded into `workdir`).
 

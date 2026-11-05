@@ -110,6 +110,7 @@ def test_agent_forks_and_best_branch_wins():
     assert len(fp["deleted_nodes"]) == 2
     assert backend.live_ids() == set()
     assert report["leftover_sandboxes"] == []
+    assert "running" not in report["tree"] and "<- head" in report["tree"]
     assert "count_primes" in report["diff"] and "bytearray" in report["diff"]
     # each branch's model calls saw the shared prefix plus its own turns, with valid tool pairing
     branch_calls = [c for c in llm.calls if c["branch"]]

@@ -163,7 +163,6 @@ class Explorer:
             report.update(status="error", error=f"{type(e).__name__}: {e}")
             raise
         finally:
-            report["tree"] = engine.render_tree(run.id)
             report["fork_points"] = self._fork_points
             report["branches"] = [
                 {
@@ -180,6 +179,7 @@ class Explorer:
             ]
             report["usage_by_model"] = self._usage_by_model()
             deleted = await engine.finish_run(run.id, keep_head=cfg.keep_head)
+            report["tree"] = engine.render_tree(run.id)  # after teardown, so statuses are final
             report["sandboxes_deleted"] = len(deleted) + sum(
                 len(fp["deleted_nodes"]) for fp in self._fork_points
             )
