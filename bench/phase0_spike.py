@@ -1,4 +1,4 @@
-"""Phase 0 spike: measure Daytona VM fork / snapshot / pause latency and fork behavior.
+"""Phase 0 spike: measure sandbox fork / snapshot / pause latency and fork behavior (E2B or Daytona).
 
 Answers the unknowns in PLAN.md section 2:
   1. fork latency vs RAM in use and disk dirtied
@@ -8,13 +8,14 @@ Answers the unknowns in PLAN.md section 2:
   6. whether a parent with live forks can be deleted, and whether a paused VM can be forked
 
 Usage
-  DAYTONA_API_KEY=... python bench/phase0_spike.py                 # default sweep
+  E2B_API_KEY=... python bench/phase0_spike.py                     # default sweep on E2B
+  DAYTONA_API_KEY=... python bench/phase0_spike.py --backend daytona
   python bench/phase0_spike.py --mem-mib 0 512 --fanout 2 4 --depth 5 --repeats 2
-  python bench/phase0_spike.py --fake                               # dry run, no Daytona calls
+  python bench/phase0_spike.py --fake                               # dry run, no provider calls
 
 Results go to bench/results/phase0-<timestamp>.json plus a Markdown summary on stdout.
 Everything the script creates is deleted at the end, leaves first, even on failure.
-Billing/storage cost (unknown 5) is not measurable from the API; check the Daytona dashboard after.
+Billing/storage cost (unknown 5) is not measurable from the API; check the provider dashboard after.
 """
 
 from __future__ import annotations
@@ -89,6 +90,12 @@ class Tracker:
         child = await self.backend.fork(sid)
         self.parent_of[child] = sid
         return child
+
+    async def fork_many(self, sid: str, n: int) -> list[str]:
+        children = await self.backend.fork_many(sid, n)  # type: ignore[attr-defined]
+        for c in children:
+            self.parent_of[c] = sid
+        return children
 
     async def delete(self, sid: str) -> None:
         await self.backend.delete(sid)
@@ -183,10 +190,17 @@ async def spike(args: argparse.Namespace, backend: SandboxBackend) -> dict[str, 
         except Exception as e:
             results["delete_parent_with_live_fork"] = f"refused: {type(e).__name__}: {e}"[:400]
         await t.delete(child)
-        if root in t.deleted:  # the documented constraint didn't hold; start a new root
+        if root in t.deleted:  # the parent was deletable; start a new root with the same probes running
             root = await t.create(snapshot=args.snapshot)
+            await must(backend, root, COUNTER)
+            await must(backend, root, RNG)
+            await asyncio.sleep(args.settle)
 
         dt_pause, _ = await timed(backend.pause(root))
+        # Ask the provider directly first (E2BBackend otherwise resumes, forks and re-pauses for us).
+        auto = getattr(backend, "auto_resume_paused", None)
+        if auto is not None:
+            backend.auto_resume_paused = False  # type: ignore[attr-defined]
         try:
             dt_fp, paused_child = await timed(t.fork(root))
             results["fork_of_paused_vm"] = {"supported": True, "fork_s": round(dt_fp, 3)}
@@ -194,7 +208,18 @@ async def spike(args: argparse.Namespace, backend: SandboxBackend) -> dict[str, 
             await t.delete(paused_child)
         except Exception as e:
             results["fork_of_paused_vm"] = {"supported": False, "error": str(e)[:400]}
-        dt_resume, _ = await timed(backend.resume(root))
+        if auto is not None:
+            backend.auto_resume_paused = auto  # type: ignore[attr-defined]
+            try:
+                dt_fp, paused_child = await timed(t.fork(root))
+                results["fork_of_paused_vm"]["via_adapter_s"] = round(dt_fp, 3)
+                await t.delete(paused_child)
+            except Exception as e:
+                results["fork_of_paused_vm"]["via_adapter_error"] = str(e)[:400]
+        if await backend.state(root) == "paused":
+            dt_resume, _ = await timed(backend.resume(root))
+        else:
+            dt_resume = float("nan")
         results["pause_resume_idle"] = {"pause_s": round(dt_pause, 3), "resume_s": round(dt_resume, 3)}
 
         # --- 1 + 2: latency vs memory / disk size ----------------------------------------
@@ -228,10 +253,10 @@ async def spike(args: argparse.Namespace, backend: SandboxBackend) -> dict[str, 
             if not args.skip_snapshots:
                 name = f"sfork-spike-{int(time.time())}-{mem_total}"
                 try:
-                    dt, _ = await timed(backend.hot_snapshot(root, name))
-                    t.snapshots.append(name)
+                    dt, snap = await timed(backend.hot_snapshot(root, name))
+                    t.snapshots.append(snap)
                     row["hot_snapshot_s"] = round(dt, 3)
-                    dt, restored = await timed(t.create(snapshot=name))
+                    dt, restored = await timed(t.create(snapshot=snap))
                     row["restore_from_hot_snapshot_s"] = round(dt, 3)
                     r = await backend.exec(restored, "cat /tmp/sfork-counter", timeout=30)
                     row["restored_processes_running"] = r.ok and r.output.strip() not in ("", "0")
@@ -243,22 +268,35 @@ async def spike(args: argparse.Namespace, backend: SandboxBackend) -> dict[str, 
         results["size_sweep"] = sweep
 
         # --- 3a: fan-out --------------------------------------------------------------
+        # Backends with fork_many (E2B) make N children from one checkpoint, as the engine does.
+        batched = hasattr(backend, "fork_many")
         fan = []
         for n in args.fanout:
             t0 = time.perf_counter()
-            per = await asyncio.gather(*(timed(t.fork(root)) for _ in range(n)), return_exceptions=True)
-            wall = time.perf_counter() - t0
-            ok = [p for p in per if not isinstance(p, BaseException)]
-            errs = [str(p)[:200] for p in per if isinstance(p, BaseException)]
+            if batched:
+                try:
+                    kids, errs = await t.fork_many(root, n), []
+                except Exception as e:
+                    kids, errs = [], [str(e)[:200]]
+                wall = time.perf_counter() - t0
+                per_fork = None
+            else:
+                per = await asyncio.gather(*(timed(t.fork(root)) for _ in range(n)), return_exceptions=True)
+                wall = time.perf_counter() - t0
+                ok = [p for p in per if not isinstance(p, BaseException)]
+                kids = [c for _, c in ok]
+                errs = [str(p)[:200] for p in per if isinstance(p, BaseException)]
+                per_fork = summarize([d for d, _ in ok]) if ok else None
             fan.append(
                 {
                     "n": n,
+                    "mode": "batched" if batched else "parallel",
                     "wall_s": round(wall, 3),
-                    "per_fork": summarize([d for d, _ in ok]) if ok else None,
+                    "per_fork": per_fork,
                     "errors": errs,
                 }
             )
-            await asyncio.gather(*(t.delete(c) for _, c in ok))
+            await asyncio.gather(*(t.delete(c) for c in kids))
         results["fanout"] = fan
 
         # --- 3b: depth (fork of fork of fork ...) ---------------------------------------
@@ -330,7 +368,8 @@ def markdown(results: dict[str, Any]) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--snapshot", default=None, help="VM snapshot for the root (default daytona-vm-small)")
+    p.add_argument("--backend", choices=["e2b", "daytona"], help="default: $SFORK_BACKEND, else e2b")
+    p.add_argument("--snapshot", help="root template/snapshot (e2b: base, daytona: daytona-vm-small)")
     p.add_argument("--mem-mib", type=int, nargs="+", default=[0, 512, 2048])
     p.add_argument("--disk-mib", type=int, nargs="+", default=[0, 512, 2048])
     p.add_argument("--fanout", type=int, nargs="+", default=[2, 4, 8])
@@ -363,9 +402,9 @@ async def amain(argv: list[str] | None = None) -> int:
     if args.fake:
         backend = make_fake()
     else:
-        from sfork.daytona.real import DaytonaBackend
+        from sfork.daytona import make_backend
 
-        backend = DaytonaBackend(default_snapshot=args.snapshot or "daytona-vm-small")
+        backend = make_backend(args.backend)
     try:
         results = await spike(args, backend)
     finally:

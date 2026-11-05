@@ -1,7 +1,8 @@
 """`sfork` CLI: drive the execution tree by hand (Phase 1).
 
 State lives in a SQLite file (SFORK_DB, default ~/.sfork/tree.db). Commands that touch sandboxes use
-real Daytona VMs and need DAYTONA_API_KEY. `sfork demo` runs entirely on the in-process fake.
+a real backend chosen by SFORK_BACKEND (`e2b`, the default, needs E2B_API_KEY;
+`daytona` needs DAYTONA_API_KEY). `sfork demo` runs entirely on the in-process fake.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from .core.store import TreeStore
 from .daytona.fake import FakeBackend
 from .orchestrator.engine import TreeEngine
 
-app = typer.Typer(help="Fork-on-action execution trees over Daytona VM sandboxes.", no_args_is_help=True)
+app = typer.Typer(help="Fork-on-action execution trees over E2B or Daytona sandboxes.", no_args_is_help=True)
 
 
 def _db_path() -> Path:
@@ -30,9 +31,9 @@ def _db_path() -> Path:
 
 def _with_engine[T](fn: Callable[[TreeEngine], Awaitable[T]]) -> T:
     async def go() -> T:
-        from .daytona.real import DaytonaBackend
+        from .daytona import make_backend
 
-        backend = DaytonaBackend()
+        backend = make_backend()
         store = TreeStore(_db_path())
         try:
             return await fn(TreeEngine(store, backend, budget=Budget()))
@@ -147,14 +148,14 @@ def finish(run_id: str, keep_head: bool = False) -> None:
 
 @app.command()
 def tree(run_id: str) -> None:
-    """Print a run's execution tree (no Daytona calls)."""
+    """Print a run's execution tree (no sandbox calls)."""
     store = TreeStore(_db_path())
     typer.echo(TreeEngine(store, FakeBackend()).render_tree(run_id))
 
 
 @app.command()
 def runs() -> None:
-    """List runs (no Daytona calls)."""
+    """List runs (no sandbox calls)."""
     store = TreeStore(_db_path())
     for r in store.list_runs():
         typer.echo(f"{r.id}  {r.status}  head={r.head_node_id}  {r.task}")

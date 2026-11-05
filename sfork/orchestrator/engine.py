@@ -250,12 +250,27 @@ class TreeEngine:
         self, parent: Node, hypotheses: Iterable[str | None], *, kind: NodeKind
     ) -> list[Node]:
         hyps = list(hypotheses)
+        # Backends that can make N children from one checkpoint (E2B) get a single batched call, so
+        # the parent pauses once instead of N times and every child sees the same instant.
+        batch: list[str] = []
+        batch_s = 0.0
+        fork_many = getattr(self.backend, "fork_many", None)
+        if fork_many is not None and len(hyps) > 1:
+            t0 = time.monotonic()
+            try:
+                batch = await fork_many(parent.sandbox_id, len(hyps))
+            except BackendError as e:  # fork_many cleans up its own partial children
+                raise EngineError(f"fork of {parent.id} failed: {e}") from e
+            batch_s = time.monotonic() - t0
 
         async def one(i: int, hyp: str | None) -> Node:
-            async with self._fork_sem:
-                t0 = time.monotonic()
-                sid = await self.backend.fork(parent.sandbox_id, name=f"sfork-{parent.id}-{i}")
-                fork_s = time.monotonic() - t0
+            if batch:
+                sid, fork_s = batch[i], batch_s
+            else:
+                async with self._fork_sem:
+                    t0 = time.monotonic()
+                    sid = await self.backend.fork(parent.sandbox_id, name=f"sfork-{parent.id}-{i}")
+                    fork_s = time.monotonic() - t0
             child = Node(
                 run_id=parent.run_id,
                 sandbox_id=sid,
