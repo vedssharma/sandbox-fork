@@ -5,8 +5,9 @@ At a decision point the running VM (disk, memory and processes) is forked into N
 child tries one approach, the best one is promoted and the rest are deleted. The same machinery
 gives checkpoints you can rewind to. See [PLAN.md](PLAN.md) for the full design and roadmap.
 
-**Status:** Phase 0 (measurement spike) and the Phase 1 tree-engine skeleton. No agent or
-evaluator yet.
+**Status:** Phase 0 spike, Phase 1 tree engine, and the first end-to-end loop: a Claude agent
+that forks its sandbox and conversation at a decision point, an evaluator that scores each branch on
+tests and benchmarks, and promotion of the winner (`sfork explore`).
 
 ## Layout
 
@@ -14,9 +15,13 @@ evaluator yet.
 sfork/
   core/          Run/Node models, SQLite tree store, budgets
   daytona/       SandboxBackend interface, E2BBackend, DaytonaBackend, FakeBackend (tests)
-  orchestrator/  TreeEngine: fork, checkpoint, rewind, promote, gc, compact
+  orchestrator/  TreeEngine (fork, checkpoint, rewind, promote, gc, compact) and Explorer (agent loop)
+  agent/         Claude tool-use loop, tools, conversation forking, scripted LLM for tests
+  eval/          sandbox-fork.toml config, gate/test/benchmark runners, lexicographic ranking
   guest/         post-fork hook run inside each forked VM (machine-id, RNG, hostname, clock)
   cli.py         `sfork` command
+examples/
+  count_primes/  demo task: trial division vs sieve, scored on correctness then latency
 bench/
   phase0_spike.py  fork / snapshot / pause latency and fork-behavior measurements
 tests/           unit tests against the fake backend
@@ -30,6 +35,39 @@ pip install -e '.[dev]'
 pytest -q
 sfork demo          # schema-migration walkthrough on the fake backend, no credentials needed
 ```
+
+## The agent loop: `sfork explore`
+
+```bash
+export ANTHROPIC_API_KEY=... E2B_API_KEY=...
+sfork explore examples/count_primes                      # agent decides when to fork
+sfork explore examples/count_primes --orchestrator-fork  # fork the root into the task's [[alternatives]] first
+sfork explore examples/count_primes --backend local      # no E2B; runs commands on THIS machine
+```
+
+What happens: the root sandbox is seeded with `repo/` (and a baseline git commit), the agent works
+through `bash`/`read_file`/`write_file`/`run_tests`, and when it calls `fork` with 2-4 alternatives
+the engine forks the sandbox once per alternative (the parent pauses as a checkpoint) and copies the
+conversation into each child with a note naming its approach. Branches run concurrently until they
+call `done` or hit their step/time budget. The evaluator then runs the task's gates, tests and
+benchmarks in every branch and ranks them: gates first, then test pass rate, then benchmarks
+(normalized against the best branch, median of repeats), so a faster branch never beats a more
+correct one. The winner becomes the head, losers are deleted right away, and at the end the head's
+`git diff` and a JSON report (tree, per-branch evaluations, why the winner won, token usage per
+model) are written to `bench/results/`. Every sandbox is deleted when the run ends, including on
+errors (`--keep-head` keeps the winner).
+
+Defaults: `claude-opus-5-5` for the root and branches (`--worker-model` to change branches),
+effort `medium`, adaptive thinking, prompt caching (branches share the fork-point prefix) and
+server-side refusal fallbacks. History is append-only, so every branch stays valid under preserved
+thinking. Forks nest up to `--max-fork-depth` (default 1: branches can't fork again).
+
+The Anthropic SDK honors `ANTHROPIC_BASE_URL`. Some hosted environments (including Claude Code
+cloud sessions) set it for their own use; if requests fail with an auth error there, run with
+`env -u ANTHROPIC_BASE_URL sfork explore ...`.
+
+A task directory holds `task.md` (the prompt), `sandbox-fork.toml` (eval config, see
+`sfork/eval/config.py`) and `repo/` (files seeded into `workdir`).
 
 ## Choosing a backend
 

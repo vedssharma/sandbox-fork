@@ -188,5 +188,98 @@ def demo() -> None:
     asyncio.run(go())
 
 
+@app.command()
+def explore(
+    task_dir: Annotated[Path, typer.Argument(help="task directory: task.md, sandbox-fork.toml, repo/")],
+    backend: Annotated[
+        str | None, typer.Option(help="e2b (default) | daytona | local (no isolation!)")
+    ] = None,
+    model: Annotated[str, typer.Option(help="model for the root agent")] = "claude-opus-5-5",
+    worker_model: Annotated[
+        str | None, typer.Option(help="model for forked branches (default: --model)")
+    ] = None,
+    effort: Annotated[str, typer.Option(help="low | medium | high | xhigh | max")] = "medium",
+    max_steps: Annotated[int, typer.Option(help="LLM turns per branch")] = 30,
+    max_fanout: int = 3,
+    max_fork_depth: Annotated[int, typer.Option(help="1 = branches can't fork again")] = 1,
+    orchestrator_fork: Annotated[
+        bool, typer.Option(help="fork the root into the task's [[alternatives]] before the agent starts")
+    ] = False,
+    keep_head: Annotated[bool, typer.Option(help="leave the winning sandbox running")] = False,
+    report: Annotated[Path | None, typer.Option(help="write the JSON report here")] = None,
+) -> None:
+    """Run an agent on a task; at fork points it branches the sandbox, and the best branch wins."""
+    import json
+    import time
+
+    from .agent.llm import AnthropicLLM
+    from .daytona import make_backend
+    from .orchestrator.explore import ExploreConfig, Explorer, Task
+
+    task = Task.load(task_dir)
+    name = (backend or os.environ.get("SFORK_BACKEND") or "e2b").lower()
+    if name == "local":
+        typer.secho("local backend: commands run on THIS machine, not in a sandbox", fg="yellow", err=True)
+    cfg = ExploreConfig(
+        model=model,
+        worker_model=worker_model,
+        max_steps_root=max_steps,
+        max_steps_branch=max_steps,
+        max_fanout=max_fanout,
+        max_fork_depth=max_fork_depth,
+        keep_head=keep_head,
+        initial_alternatives=Task.alternatives_from(task_dir) if orchestrator_fork else None,
+    )
+
+    def show(e: dict) -> None:
+        kind = e["type"]
+        who = e.get("branch") or "root"
+        if kind == "tool":
+            typer.echo(f"  [{who}] {e['name']} {e.get('arg', '')}"[:160])
+        elif kind == "say":
+            typer.echo(f"  [{who}] says: {e['text']}"[:200])
+        elif kind != "seeded":
+            typer.secho(
+                f"* {kind}: " + json.dumps({k: v for k, v in e.items() if k not in ("t", "type")}), fg="cyan"
+            )
+
+    async def go() -> dict:
+        be = make_backend(name)
+        llm = AnthropicLLM(effort=effort)
+        engine = TreeEngine(
+            TreeStore(_db_path()),
+            be,
+            budget=Budget(max_fanout=max(max_fanout, 1)),
+            run_post_fork_hook=name != "local",
+        )
+        try:
+            return await Explorer(engine, llm, cfg, on_event=show).run(task)
+        finally:
+            await llm.close()
+            await be.close()
+
+    rep = asyncio.run(go())
+    out = (
+        report
+        or Path("bench/results")
+        / f"explore-{task.name}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rep, indent=2, default=str))
+    typer.echo("")
+    typer.echo(rep["tree"])
+    for fp in rep["fork_points"]:
+        typer.echo(f"\nfork at {fp['node']} ({fp['fork_seconds']}s): {fp['why']}")
+    typer.echo(
+        f"\nhead: {rep.get('head_branch') or 'root'}  final: {rep.get('final_evaluation', {}).get('passed')}"
+        f"/{rep.get('final_evaluation', {}).get('total')} tests"
+    )
+    typer.echo(f"usage: {json.dumps(rep['usage_by_model'])}")
+    typer.echo(
+        f"sandboxes deleted: {rep['sandboxes_deleted']}, leftover: {rep['leftover_sandboxes'] or 'none'}"
+    )
+    typer.echo(f"wall: {rep['wall_seconds']}s  report: {out}")
+
+
 if __name__ == "__main__":
     app()
