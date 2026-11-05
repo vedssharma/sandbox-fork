@@ -1,4 +1,4 @@
-"""Phase 0 spike: measure Daytona VM fork / snapshot / pause latency and fork behavior.
+"""Phase 0 spike: measure sandbox fork / snapshot / pause latency and fork behavior (E2B or Daytona).
 
 Answers the unknowns in PLAN.md section 2:
   1. fork latency vs RAM in use and disk dirtied
@@ -8,13 +8,14 @@ Answers the unknowns in PLAN.md section 2:
   6. whether a parent with live forks can be deleted, and whether a paused VM can be forked
 
 Usage
-  DAYTONA_API_KEY=... python bench/phase0_spike.py                 # default sweep
+  E2B_API_KEY=... python bench/phase0_spike.py                     # default sweep on E2B
+  DAYTONA_API_KEY=... python bench/phase0_spike.py --backend daytona
   python bench/phase0_spike.py --mem-mib 0 512 --fanout 2 4 --depth 5 --repeats 2
-  python bench/phase0_spike.py --fake                               # dry run, no Daytona calls
+  python bench/phase0_spike.py --fake                               # dry run, no provider calls
 
 Results go to bench/results/phase0-<timestamp>.json plus a Markdown summary on stdout.
 Everything the script creates is deleted at the end, leaves first, even on failure.
-Billing/storage cost (unknown 5) is not measurable from the API; check the Daytona dashboard after.
+Billing/storage cost (unknown 5) is not measurable from the API; check the provider dashboard after.
 """
 
 from __future__ import annotations
@@ -228,10 +229,10 @@ async def spike(args: argparse.Namespace, backend: SandboxBackend) -> dict[str, 
             if not args.skip_snapshots:
                 name = f"sfork-spike-{int(time.time())}-{mem_total}"
                 try:
-                    dt, _ = await timed(backend.hot_snapshot(root, name))
-                    t.snapshots.append(name)
+                    dt, snap = await timed(backend.hot_snapshot(root, name))
+                    t.snapshots.append(snap)
                     row["hot_snapshot_s"] = round(dt, 3)
-                    dt, restored = await timed(t.create(snapshot=name))
+                    dt, restored = await timed(t.create(snapshot=snap))
                     row["restore_from_hot_snapshot_s"] = round(dt, 3)
                     r = await backend.exec(restored, "cat /tmp/sfork-counter", timeout=30)
                     row["restored_processes_running"] = r.ok and r.output.strip() not in ("", "0")
@@ -330,7 +331,8 @@ def markdown(results: dict[str, Any]) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--snapshot", default=None, help="VM snapshot for the root (default daytona-vm-small)")
+    p.add_argument("--backend", choices=["e2b", "daytona"], help="default: $SFORK_BACKEND, else e2b")
+    p.add_argument("--snapshot", help="root template/snapshot (e2b: base, daytona: daytona-vm-small)")
     p.add_argument("--mem-mib", type=int, nargs="+", default=[0, 512, 2048])
     p.add_argument("--disk-mib", type=int, nargs="+", default=[0, 512, 2048])
     p.add_argument("--fanout", type=int, nargs="+", default=[2, 4, 8])
@@ -363,9 +365,9 @@ async def amain(argv: list[str] | None = None) -> int:
     if args.fake:
         backend = make_fake()
     else:
-        from sfork.daytona.real import DaytonaBackend
+        from sfork.daytona import make_backend
 
-        backend = DaytonaBackend(default_snapshot=args.snapshot or "daytona-vm-small")
+        backend = make_backend(args.backend)
     try:
         results = await spike(args, backend)
     finally:

@@ -1,11 +1,12 @@
 [project]
 name = "sandbox-fork"
 version = "0.1.0"
-description = "Fork-on-action and speculative exploration for coding agents, on Daytona VM sandboxes."
+description = "Fork-on-action and speculative exploration for coding agents, on E2B or Daytona sandboxes."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "daytona>=0.202.0",
+    "e2b>=2.63",
     "typer>=0.12",
 ]
 
