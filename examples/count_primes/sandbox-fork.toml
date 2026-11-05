@@ -1,0 +1,30 @@
+# Evaluator config for the count_primes demo (see sfork/eval/config.py).
+workdir = "/workspace"
+setup = ["python3 --version"]
+
+[[gates]]
+name = "compiles"
+cmd = "python3 -m py_compile primes.py"
+timeout = 60
+
+[tests]
+cmd = "python3 test_primes.py"
+parse = "json"
+timeout = 300
+
+[[benchmarks]]
+name = "latency_ms"
+cmd = "python3 bench.py"
+parse = "json:ms"
+direction = "lower"
+repeats = 3
+timeout = 300
+
+# Used by `sfork explore --orchestrator-fork`: fork the root before the agent starts.
+[[alternatives]]
+name = "trial-division"
+plan = "Trial division by 2 and odd numbers up to isqrt(k), for every k <= n."
+
+[[alternatives]]
+name = "sieve"
+plan = "Sieve of Eratosthenes over a bytearray, using slice assignment to clear multiples."

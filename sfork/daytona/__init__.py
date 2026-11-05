@@ -8,12 +8,13 @@ __all__ = [
     "E2BBackend",
     "ExecResult",
     "FakeBackend",
+    "LocalBackend",
     "ParentHasChildrenError",
     "SandboxBackend",
     "make_backend",
 ]
 
-BACKENDS = ("e2b", "daytona")
+BACKENDS = ("e2b", "daytona", "local")
 
 
 def make_backend(name: str | None = None, **kwargs) -> SandboxBackend:
@@ -29,6 +30,10 @@ def make_backend(name: str | None = None, **kwargs) -> SandboxBackend:
         from .real import DaytonaBackend
 
         return DaytonaBackend(**kwargs)
+    if name == "local":  # tests / offline dry runs only: runs commands on this host
+        from .local import LocalBackend
+
+        return LocalBackend(**kwargs)
     raise ValueError(f"unknown backend {name!r}; expected one of {BACKENDS}")
 
 
@@ -38,6 +43,10 @@ def __getattr__(name: str):
         from .real import DaytonaBackend
 
         return DaytonaBackend
+    if name == "LocalBackend":
+        from .local import LocalBackend
+
+        return LocalBackend
     if name == "E2BBackend":
         from .e2b import E2BBackend
 
