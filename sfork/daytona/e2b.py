@@ -9,7 +9,12 @@ How our protocol maps onto E2B (SDK `e2b` 2.63):
   open command streams drop during the pause, which is fine for us because every `exec` is a fresh
   request. `fork_many` makes N children from a single checkpoint (up to 20 per call).
 - E2B only forks running sandboxes, so forking a paused checkpoint resumes it, forks, and pauses it
-  again. That keeps the engine's "checkpoints are paused" model intact.
+  again. That keeps the engine's "checkpoints are paused" model intact. Set `auto_resume_paused`
+  to False to see the raw API behaviour (a 409).
+- E2B rejects a fork while the same parent is still being checkpointed for another fork (409
+  "snapshotting"), so forks of one parent are serialized with a per-parent lock.
+- A snapshot can't be deleted while sandboxes created from it are still running (400); delete
+  those sandboxes first.
 - `pause` / `resume` -> `pause(mode="full")` / `connect()`; memory and processes survive.
 - `hot_snapshot` -> `create_snapshot(name, mode="full")`; returns the snapshot id, which `create`
   accepts in place of a template name. Snapshots survive deletion of the source sandbox.
@@ -59,6 +64,8 @@ class E2BBackend:
         self._metadata = {"sfork": "1", **(metadata or {})}
         self._cache: dict[str, Any] = {}  # sandbox id -> AsyncSandbox
         self._paused: set[str] = set()
+        self._fork_locks: dict[str, asyncio.Lock] = {}
+        self.auto_resume_paused = True
 
     # helpers ----------------------------------------------------------------
     async def _retry(self, op: str, fn: Callable[[], Awaitable[T]]) -> T:
@@ -104,7 +111,12 @@ class E2BBackend:
         """Fork `count` children from one checkpoint of `sandbox_id`. All-or-nothing."""
         if count < 1:
             return []
-        repause = sandbox_id in self._paused
+        lock = self._fork_locks.setdefault(sandbox_id, asyncio.Lock())
+        async with lock:
+            return await self._fork_many_locked(sandbox_id, count)
+
+    async def _fork_many_locked(self, sandbox_id: str, count: int) -> list[str]:
+        repause = self.auto_resume_paused and sandbox_id in self._paused
         if repause:
             await self.resume(sandbox_id)
         made: list[str] = []
@@ -174,6 +186,7 @@ class E2BBackend:
         await self._retry("delete", lambda: self._cls.kill(sandbox_id))
         self._cache.pop(sandbox_id, None)
         self._paused.discard(sandbox_id)
+        self._fork_locks.pop(sandbox_id, None)
 
     async def state(self, sandbox_id: str) -> str:
         from e2b import NotFoundException

@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("e2b")
 
-from e2b import CommandExitException, NotFoundException  # noqa: E402
+from e2b import CommandExitException, NotFoundException, SandboxException  # noqa: E402
 
 from sfork.core.store import TreeStore  # noqa: E402
 from sfork.daytona import BackendError, SandboxBackend, make_backend  # noqa: E402
@@ -57,7 +57,10 @@ class StubSandbox:
         cls.calls.append(("fork", sandbox_id, count))
         box = cls.boxes[sandbox_id]
         if box["state"] != "running":
-            raise RuntimeError("can only fork a running sandbox")
+            raise SandboxException(f"409: sandbox is {box['state']} and cannot be forked")
+        box["state"] = "snapshotting"
+        await asyncio.sleep(0.01)
+        box["state"] = "running"
         out = []
         for i in range(count):
             if cls.fail_fork_index == i:
@@ -155,6 +158,26 @@ def test_fork_of_paused_checkpoint_resumes_then_repauses(be):
         child = await be.fork(root)
         assert await be.state(child) == "started"
         assert await be.state(root) == "paused"
+
+    run(go())
+
+
+def test_concurrent_forks_of_one_parent_are_serialized(be):
+    async def go():
+        root = await be.create()
+        kids = await asyncio.gather(be.fork(root), be.fork(root), be.fork_many(root, 2))
+        assert len({kids[0], kids[1], *kids[2]}) == 4
+
+    run(go())
+
+
+def test_raw_fork_of_paused_parent_is_rejected_without_auto_resume(be):
+    async def go():
+        root = await be.create()
+        await be.pause(root)
+        be.auto_resume_paused = False
+        with pytest.raises(BackendError, match="paused"):
+            await be.fork(root)
 
     run(go())
 
