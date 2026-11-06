@@ -9,12 +9,14 @@ __all__ = [
     "ExecResult",
     "FakeBackend",
     "LocalBackend",
+    "MorphBackend",
     "ParentHasChildrenError",
     "SandboxBackend",
+    "TensorlakeBackend",
     "make_backend",
 ]
 
-BACKENDS = ("e2b", "daytona", "local")
+BACKENDS = ("e2b", "morph", "tensorlake", "daytona", "local")
 
 
 def make_backend(name: str | None = None, **kwargs) -> SandboxBackend:
@@ -26,6 +28,14 @@ def make_backend(name: str | None = None, **kwargs) -> SandboxBackend:
         from .e2b import E2BBackend
 
         return E2BBackend(**kwargs)
+    if name == "morph":
+        from .morph import MorphBackend
+
+        return MorphBackend(**kwargs)
+    if name == "tensorlake":
+        from .tensorlake import TensorlakeBackend
+
+        return TensorlakeBackend(**kwargs)
     if name == "daytona":
         from .real import DaytonaBackend
 
@@ -51,4 +61,12 @@ def __getattr__(name: str):
         from .e2b import E2BBackend
 
         return E2BBackend
+    if name == "MorphBackend":
+        from .morph import MorphBackend
+
+        return MorphBackend
+    if name == "TensorlakeBackend":
+        from .tensorlake import TensorlakeBackend
+
+        return TensorlakeBackend
     raise AttributeError(name)

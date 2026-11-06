@@ -1,8 +1,9 @@
 """`sfork` CLI: drive the execution tree by hand (Phase 1).
 
 State lives in a SQLite file (SFORK_DB, default ~/.sfork/tree.db). Commands that touch sandboxes use
-a real backend chosen by SFORK_BACKEND (`e2b`, the default, needs E2B_API_KEY;
-`daytona` needs DAYTONA_API_KEY). `sfork demo` runs entirely on the in-process fake.
+a real backend chosen by SFORK_BACKEND (`e2b`, the default, needs E2B_API_KEY; `morph` needs
+MORPH_API_KEY; `tensorlake` needs TENSORLAKE_API_KEY; `daytona` needs DAYTONA_API_KEY).
+`sfork demo` runs entirely on the in-process fake.
 """
 
 from __future__ import annotations
@@ -192,7 +193,7 @@ def demo() -> None:
 def explore(
     task_dir: Annotated[Path, typer.Argument(help="task directory: task.md, sandbox-fork.toml, repo/")],
     backend: Annotated[
-        str | None, typer.Option(help="e2b (default) | daytona | local (no isolation!)")
+        str | None, typer.Option(help="e2b (default) | morph | tensorlake | daytona | local (no isolation!)")
     ] = None,
     model: Annotated[str, typer.Option(help="model for the root agent")] = "claude-opus-5-5",
     worker_model: Annotated[
