@@ -7,7 +7,8 @@ gives checkpoints you can rewind to. See [PLAN.md](PLAN.md) for the full design 
 
 **Status:** Phase 0 spike, Phase 1 tree engine, and the first end-to-end loop: a Claude agent
 that forks its sandbox and conversation at a decision point, an evaluator that scores each branch on
-tests and benchmarks, and promotion of the winner (`sfork explore`).
+tests and benchmarks, and promotion of the winner (`sfork explore`), plus checkpoints the agent can
+rewind to when a step breaks something (`examples/billing_migration`).
 
 ## Layout
 
@@ -21,7 +22,8 @@ sfork/
   guest/         post-fork hook run inside each forked VM (machine-id, RNG, hostname, clock)
   cli.py         `sfork` command
 examples/
-  count_primes/  demo task: trial division vs sieve, scored on correctness then latency
+  count_primes/       demo task: trial division vs sieve, scored on correctness then latency
+  billing_migration/  demo task: a reviewed migration silently corrupts a Postgres table; rewind and fix
 bench/
   phase0_spike.py  fork / snapshot / pause latency and fork-behavior measurements
 tests/           unit tests against the fake backend
@@ -67,7 +69,46 @@ cloud sessions) set it for their own use; if requests fail with an auth error th
 `env -u ANTHROPIC_BASE_URL sfork explore ...`.
 
 A task directory holds `task.md` (the prompt), `sandbox-fork.toml` (eval config, see
-`sfork/eval/config.py`) and `repo/` (files seeded into `workdir`).
+`sfork/eval/config.py`), `repo/` (files seeded into `workdir` and committed as the baseline) and
+optionally `fixtures/` (written to `/tmp/sfork-fixtures` before `setup` runs and kept out of git, for
+setup-only material such as a data loader).
+
+## Checkpoints and rewind
+
+The agent also gets `checkpoint(label)` and `rewind(checkpoint_id, lesson)`. A checkpoint freezes
+the current sandbox (disk, memory, running processes such as a database server) as a paused restore
+point and moves the agent onto a fork of it. `rewind` forks a fresh sandbox from the checkpoint,
+deletes the abandoned one and everything after it, and cuts the conversation back to the turn that
+took the checkpoint. The tool calls in that turn that hadn't run yet are answered as "not run", and
+a note carries every lesson so far, so the agent doesn't repeat what failed. Checkpoints are never
+modified, so you can rewind to the same one again. The history stays append-only from the
+checkpoint's prefix, which keeps it valid under preserved thinking and reuses the prompt cache.
+
+Risky bash commands are checkpointed automatically before they run (`sfork/agent/policy.py`):
+migration runners, destructive SQL (`DROP`, `ALTER TABLE`, `UPDATE ... SET`, `DELETE FROM`), a
+database client fed a script, `rm -r`, `git reset --hard`, force pushes. Commands that only read are
+skipped. The command's output names the checkpoint to rewind to. Configure it per task:
+
+```toml
+[checkpoints]
+auto = true                 # false: no automatic checkpoints (the tools stay)
+also_before = ['\bdeploy\b'] # extra regexes; `before = [...]` replaces the defaults
+```
+
+`--no-checkpoints` removes the tools (a baseline), `--no-auto-checkpoint` keeps the tools but
+skips the automatic ones. Limits: 8 checkpoints per run, 4 rewinds per branch. The report lists
+every checkpoint and rewind (with the lesson), and includes each branch's final transcript.
+
+```bash
+sfork explore examples/billing_migration      # Postgres in the sandbox; needs E2B (apt installs postgresql)
+```
+
+In that demo the agent rehearses a reviewed migration on a copy of production. The migration casts
+a legacy `real` column with `amount::numeric(12,2)`, which keeps only 6 significant digits, so
+every invoice of $10,000 or more gets the wrong cents, and then it drops the original column. The
+damage can't be repaired in place and the data generator is deleted after setup, so the agent
+rewinds to the checkpoint taken before `./migrate.sh`, fixes the cast, and applies it to the
+untouched copy.
 
 ## Choosing a backend
 

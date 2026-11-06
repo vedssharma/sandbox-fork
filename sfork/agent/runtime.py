@@ -1,9 +1,17 @@
 """The tool-use loop for one branch (PLAN.md section 5.1).
 
 A `Branch` is the agent state pinned to one tree node: its message history, model and counters.
-`Agent.run` drives a branch until it calls `done`, asks to `fork`, runs out of steps, or fails, and
-returns a `Stop` saying which. Forking itself belongs to the orchestrator (`sfork.orchestrator.explore`),
-which forks the sandbox and then calls `Branch.fork` once per child to copy the conversation.
+`Agent.run` drives a branch until it calls `done`, asks to `fork` or `rewind`, runs out of steps, or
+fails, and returns a `Stop` saying which. Forking and rewinding belong to the orchestrator
+(`sfork.orchestrator.explore`): it forks the sandbox and calls `Branch.fork` once per child to copy
+the conversation, or forks a fresh node from a checkpoint and calls `Branch.rewind_to`.
+
+Checkpoints happen inside a turn, through the `checkpointer` callback: the orchestrator freezes the
+branch's node as a restore point and moves the branch onto a fork of it, and the rest of the turn
+runs there. A `CheckpointRecord` remembers where in the conversation that happened, so a rewind can
+cut the history back to exactly that point and answer the turn's tool calls as if the abandoned
+timeline never ran. The history stays append-only from the checkpoint's prefix, so it remains valid
+under preserved thinking and reuses the prompt cache.
 """
 
 from __future__ import annotations
@@ -19,12 +27,30 @@ from ..daytona.base import ExecResult
 from ..eval.config import EvalConfig
 from ..eval.evaluator import evaluate, in_dir
 from .llm import BRANCH_TAG, LLM, Usage, block_get
-from .tools import ALL_TOOLS
+from .policy import CheckpointPolicy
+from .tools import ALL_TOOLS, TOOLS_WITHOUT_REWIND
 
 ExecFn = Callable[[str, str, int], Awaitable[ExecResult]]  # (node_id, command, timeout)
 EventFn = Callable[[dict[str, Any]], None]
+# (branch, label, auto) -> checkpoint id; moves the branch onto a fresh working node. Raises on refusal.
+CheckpointFn = Callable[["Branch", str, bool], Awaitable[str]]
+REWIND_TAG = "[sfork-rewound:"
 OUTPUT_LIMIT = 12_000
 WRITE_CHUNK = 48_000
+
+
+@dataclass
+class CheckpointRecord:
+    """Where in a branch's conversation a checkpoint was taken (see `Branch.rewind_to`)."""
+
+    id: str  # the checkpoint node id
+    label: str
+    auto: bool
+    msg_len: int  # len(messages) right after the assistant turn that took it
+    results_before: list[dict[str, Any]]  # tool results of that turn produced before the checkpoint
+    after_ids: list[str]  # tool_use ids in that turn not yet run at checkpoint time
+    tool_use_id: str | None = None  # the agent's checkpoint call, if it made one
+    result_text: str = ""
 
 
 @dataclass
@@ -37,6 +63,47 @@ class Branch:
     steps: int = 0
     usage: Usage = field(default_factory=Usage)
     tool_calls: int = 0
+    checkpoints: list[CheckpointRecord] = field(default_factory=list)  # oldest first, this timeline only
+    lessons: list[str] = field(default_factory=list)  # from every rewind so far, oldest first
+    rewinds: int = 0
+
+    def find_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
+        return next((c for c in self.checkpoints if c.id == checkpoint_id), None)
+
+    def rewind_to(self, rec: CheckpointRecord, *, node_id: str, lesson: str) -> None:
+        """Cut the conversation back to `rec` and continue on `node_id`, a fresh fork of it.
+
+        The kept history is the prefix up to the assistant turn that took the checkpoint. The next
+        user turn answers that turn's tool calls: the ones that ran before the checkpoint keep their
+        results, the checkpoint call (if the agent made it) gets its result, and calls after it,
+        including the command an auto-checkpoint guarded, are reported as not run. Checkpoints made
+        after `rec` belonged to the abandoned timeline and are forgotten.
+        """
+        self.rewinds += 1
+        if lesson:
+            self.lessons.append(lesson)
+        self.checkpoints = self.checkpoints[: self.checkpoints.index(rec) + 1]
+        self.node_id = node_id
+        turn: list[Any] = list(rec.results_before)
+        if rec.tool_use_id is not None:
+            turn.append(_result(rec.tool_use_id, rec.result_text))
+        for tid in rec.after_ids:
+            why = (
+                "the auto-checkpoint was taken just before this command"
+                if rec.auto and tid == rec.after_ids[0]
+                else "it came after the checkpoint in the same turn"
+            )
+            turn.append(_result(tid, f"Not run: you rewound to checkpoint {rec.id}, and {why}.", error=True))
+        lessons = "\n".join(f"{i}. {ln}" for i, ln in enumerate(self.lessons, 1)) or "(none given)"
+        note = (
+            f"{REWIND_TAG}{rec.id}] You rewound to checkpoint {rec.id} ({rec.label!r}). Everything after "
+            "it has been undone: files, databases, processes and this conversation are exactly as they "
+            "were at that point, so do not try to repair the old state; it no longer exists. "
+            f"This is rewind #{self.rewinds} in this branch. Lessons from the attempts you abandoned:\n"
+            f"{lessons}\nUse them: do not repeat what failed."
+        )
+        turn.append({"type": "text", "text": note})
+        self.messages = [*self.messages[: rec.msg_len], {"role": "user", "content": turn}]
 
     def fork(
         self,
@@ -76,11 +143,13 @@ class Branch:
 
 @dataclass
 class Stop:
-    kind: Literal["done", "fork", "budget", "failed"]
+    kind: Literal["done", "fork", "rewind", "budget", "failed"]
     summary: str = ""
     alternatives: list[dict[str, str]] = field(default_factory=list)
     tool_use_id: str | None = None
     pending_results: list[dict[str, Any]] = field(default_factory=list)
+    checkpoint_id: str | None = None  # rewind target
+    lesson: str = ""
 
 
 class Agent:
@@ -94,6 +163,8 @@ class Agent:
         max_tokens: int = 16_000,
         tool_timeout: int = 300,
         on_event: EventFn | None = None,
+        checkpointer: CheckpointFn | None = None,
+        policy: CheckpointPolicy | None = None,
     ) -> None:
         self.llm = llm
         self.exec = exec_fn
@@ -102,6 +173,9 @@ class Agent:
         self.max_tokens = max_tokens
         self.tool_timeout = tool_timeout
         self.on_event = on_event or (lambda e: None)
+        self.checkpointer = checkpointer
+        self.policy = policy if checkpointer is not None else None
+        self.tools = ALL_TOOLS if checkpointer is not None else TOOLS_WITHOUT_REWIND
 
     async def run(self, br: Branch, *, max_steps: int) -> Stop:
         nudged = False
@@ -110,7 +184,7 @@ class Agent:
                 model=br.model,
                 system=self.system,
                 messages=br.messages,
-                tools=ALL_TOOLS,
+                tools=self.tools,
                 max_tokens=self.max_tokens,
             )
             br.steps += 1
@@ -131,11 +205,46 @@ class Agent:
                 )
                 continue
 
+            rewind_call = next((u for u in uses if block_get(u, "name") == "rewind"), None)
+            if rewind_call is not None and self.checkpointer is not None:
+                # Nothing else in this turn runs: whatever it did would be undone anyway.
+                args = block_get(rewind_call, "input") or {}
+                stop = Stop(
+                    "rewind",
+                    tool_use_id=block_get(rewind_call, "id"),
+                    checkpoint_id=str(args.get("checkpoint_id", "")).strip(),
+                    lesson=str(args.get("lesson", "")).strip(),
+                    pending_results=[
+                        _result(
+                            block_get(u, "id"), "Not run: rewind was called in the same turn.", error=True
+                        )
+                        for u in uses
+                        if u is not rewind_call
+                    ],
+                )
+                self._emit(br, "rewind_request", checkpoint=stop.checkpoint_id, lesson=stop.lesson[:300])
+                return stop
+
             results: list[dict[str, Any]] = []
             fork_call = done_call = None
-            for tu in uses:
+            for i, tu in enumerate(uses):
                 name, tid = block_get(tu, "name"), block_get(tu, "id")
-                if name == "fork" and fork_call is None:
+                if name == "checkpoint" and self.checkpointer is not None:
+                    label = str((block_get(tu, "input") or {}).get("label", "")).strip() or "checkpoint"
+                    results.append(await self._checkpoint(br, uses, i, results, label=label, call_id=tid))
+                elif name == "bash" and (risky := self._risky(tu)) and not self._just_checkpointed(br, tid):
+                    try:
+                        cp = await self._checkpoint(br, uses, i, results, label=f"before: {risky[:100]}")
+                        note = (
+                            f"[auto-checkpoint {cp} saved just before this command; "
+                            f"rewind(checkpoint_id='{cp}') returns to the state before it]\n"
+                        )
+                    except Exception as e:
+                        note = f"[auto-checkpoint failed ({e}); this command ran without one]\n"
+                    res = await self._run_tool(br, tu)
+                    res["content"] = note + res["content"]
+                    results.append(res)
+                elif name == "fork" and fork_call is None:
                     fork_call = tu
                 elif name == "fork":
                     results.append(_result(tid, "Only one fork per turn; this one was ignored.", error=True))
@@ -166,6 +275,80 @@ class Agent:
             br.messages.append({"role": "user", "content": results})
         self._emit(br, "budget", steps=br.steps)
         return Stop("budget", summary=f"stopped after {br.steps} steps")
+
+    @staticmethod
+    def _just_checkpointed(br: Branch, tool_use_id: str) -> bool:
+        """The agent checkpointed earlier in this turn and nothing has run since: no second one."""
+        last = br.checkpoints[-1] if br.checkpoints else None
+        return (
+            last is not None
+            and last.msg_len == len(br.messages)
+            and bool(last.after_ids)
+            and last.after_ids[0] == tool_use_id
+        )
+
+    def _risky(self, tu: Any) -> str | None:
+        """The risky piece of a bash call's command, if the policy says to checkpoint first."""
+        if self.policy is None:
+            return None
+        return self.policy.match(str((block_get(tu, "input") or {}).get("command", "")))
+
+    async def _checkpoint(
+        self,
+        br: Branch,
+        uses: list[Any],
+        i: int,
+        results: list[dict[str, Any]],
+        *,
+        label: str,
+        call_id: str | None = None,
+    ) -> Any:
+        """Checkpoint mid-turn. For an agent call returns its tool result; for an auto-checkpoint
+        returns the checkpoint id (and raises if it could not be taken)."""
+        assert self.checkpointer is not None
+        auto = call_id is None
+        try:
+            cp = await self.checkpointer(br, label, auto)
+        except Exception as e:
+            if auto:
+                raise
+            return _result(call_id, f"Checkpoint failed: {e}", error=True)
+        text = (
+            f"Checkpoint {cp} saved ({label!r}). rewind(checkpoint_id='{cp}', lesson=...) returns the "
+            "machine and this conversation to this exact point."
+        )
+        later = uses[i:] if auto else uses[i + 1 :]
+        br.checkpoints.append(
+            CheckpointRecord(
+                id=cp,
+                label=label,
+                auto=auto,
+                msg_len=len(br.messages),
+                results_before=list(results),
+                after_ids=[block_get(u, "id") for u in later],
+                tool_use_id=call_id,
+                result_text=text,
+            )
+        )
+        self._emit(br, "checkpoint", checkpoint=cp, label=label, auto=auto)
+        return cp if auto else _result(call_id, text)
+
+    def resume_after_failed_rewind(self, br: Branch, stop: Stop, reason: str) -> None:
+        """Answer a rewind request the orchestrator refused, so the branch can keep going."""
+        valid = ", ".join(f"{c.id} ({c.label!r})" for c in br.checkpoints) or "none"
+        br.messages.append(
+            {
+                "role": "user",
+                "content": [
+                    *stop.pending_results,
+                    _result(
+                        stop.tool_use_id or "",
+                        f"Rewind refused: {reason} Checkpoints you can rewind to: {valid}.",
+                        error=True,
+                    ),
+                ],
+            }
+        )
 
     def resume_after_failed_fork(self, br: Branch, stop: Stop, reason: str) -> None:
         """Answer a fork request that the orchestrator refused, so the branch can keep going."""

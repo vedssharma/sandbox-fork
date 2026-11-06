@@ -1,0 +1,27 @@
+# Evaluator config for the billing_migration demo (see sfork/eval/config.py).
+# The database lives in a running Postgres server in the sandbox, outside the git repo, so a bad
+# migration can't be undone with git. That's what checkpoint/rewind is for.
+workdir = "/workspace"
+setup = [
+    "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/tmp/apt.log 2>&1 && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql >>/tmp/apt.log 2>&1 || (tail -20 /tmp/apt.log; exit 1)",
+    "sudo pg_ctlcluster 15 main start || sudo service postgresql start",
+    "sudo -u postgres psql -qc \"CREATE ROLE \\\"$(whoami)\\\" SUPERUSER LOGIN\" && createdb \"$(whoami)\"",
+    "psql -qX -v ON_ERROR_STOP=1 -f migrations/0001_create_customers.sql -f migrations/0002_create_invoices.sql -c \"INSERT INTO schema_migrations (version) VALUES ('0001'), ('0002')\"",
+    # Load the 'production' data. The generator is not in the repo and is deleted after use, and the
+    # data is random, so the only copy of the original names is the one in the database.
+    "python3 /tmp/sfork-fixtures/load_production_copy.py && rm -rf /tmp/sfork-fixtures",
+]
+
+[[gates]]
+name = "compiles"
+cmd = "python3 -m py_compile app/billing.py app/db.py"
+timeout = 60
+
+[tests]
+cmd = "python3 tests/test_billing.py"
+parse = "json"
+timeout = 300
+
+# Checkpoint before these commands (the defaults cover ./migrate.sh, destructive SQL, rm -rf, ...).
+[checkpoints]
+auto = true
