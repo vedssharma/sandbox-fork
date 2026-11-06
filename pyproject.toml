@@ -1,13 +1,15 @@
 [project]
 name = "sandbox-fork"
 version = "0.1.0"
-description = "Fork-on-action and speculative exploration for coding agents, on E2B or Daytona sandboxes."
+description = "Fork-on-action and speculative exploration for coding agents, on E2B, Morph Cloud, Tensorlake or Daytona sandboxes."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=2.6",
     "daytona>=0.202.0",
     "e2b>=2.63",
+    "morphcloud>=0.1.116",
+    "tensorlake>=0.5.162",
     "typer>=0.12",
 ]
 

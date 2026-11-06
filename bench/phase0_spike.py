@@ -368,8 +368,15 @@ def markdown(results: dict[str, Any]) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--backend", choices=["e2b", "daytona"], help="default: $SFORK_BACKEND, else e2b")
-    p.add_argument("--snapshot", help="root template/snapshot (e2b: base, daytona: daytona-vm-small)")
+    p.add_argument(
+        "--backend",
+        choices=["e2b", "morph", "tensorlake", "daytona"],
+        help="default: $SFORK_BACKEND, else e2b",
+    )
+    p.add_argument(
+        "--snapshot",
+        help="root template/snapshot (e2b: base, morph/tensorlake: a snapshot id, daytona: daytona-vm-small)",
+    )
     p.add_argument("--mem-mib", type=int, nargs="+", default=[0, 512, 2048])
     p.add_argument("--disk-mib", type=int, nargs="+", default=[0, 512, 2048])
     p.add_argument("--fanout", type=int, nargs="+", default=[2, 4, 8])

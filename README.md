@@ -1,6 +1,7 @@
 # sandbox-fork
 
-Fork-on-action and speculative exploration for coding agents, on E2B (default) or Daytona Linux VM sandboxes.
+Fork-on-action and speculative exploration for coding agents, on E2B (default), Morph Cloud, Tensorlake or
+Daytona Linux VM sandboxes.
 At a decision point the running VM (disk, memory and processes) is forked into N children, each
 child tries one approach, the best one is promoted and the rest are deleted. The same machinery
 gives checkpoints you can rewind to. See [PLAN.md](PLAN.md) for the full design and roadmap.
@@ -15,7 +16,7 @@ rewind to when a step breaks something (`examples/billing_migration`).
 ```
 sfork/
   core/          Run/Node models, SQLite tree store, budgets
-  daytona/       SandboxBackend interface, E2BBackend, DaytonaBackend, FakeBackend (tests)
+  daytona/       SandboxBackend interface; E2B, Morph, Tensorlake, Daytona backends; FakeBackend
   orchestrator/  TreeEngine (fork, checkpoint, rewind, promote, gc, compact) and Explorer (agent loop)
   agent/         Claude tool-use loop, tools, conversation forking, scripted LLM for tests
   eval/          sandbox-fork.toml config, gate/test/benchmark runners, lexicographic ranking
@@ -26,7 +27,7 @@ examples/
   billing_migration/  demo task: a reviewed migration silently corrupts a Postgres table; rewind and fix
 bench/
   phase0_spike.py  fork / snapshot / pause latency and fork-behavior measurements
-tests/           unit tests against the fake backend
+tests/           unit tests against the fake backend and stubbed provider SDKs
 ```
 
 ## Setup
@@ -112,12 +113,31 @@ untouched copy.
 
 ## Choosing a backend
 
-`SFORK_BACKEND` (or the spike's `--backend`) picks the provider: `e2b` (default) or `daytona`.
+`SFORK_BACKEND` (or `--backend`) picks the provider: `e2b` (default), `morph`, `tensorlake` or
+`daytona`. Every one of them forks a *running* sandbox with its memory and processes, and makes an
+N-way fork from a single capture of the parent.
 
 **E2B** needs `E2B_API_KEY`, and the network must allow `api.e2b.app` and `sandbox.e2b.app`.
 The root is created from the `base` template (override with `SFORK_E2B_TEMPLATE` or `--snapshot`).
 Sandboxes live for `SFORK_E2B_TIMEOUT` seconds (default 3600, the Hobby plan's maximum). E2B forks
 copy disk, memory and processes; a multi-way fork is one call that checkpoints the parent once.
+
+**Morph Cloud** needs `MORPH_API_KEY`, and the network must allow `cloud.morph.so`. The root boots
+from a base snapshot built once per account from the `morphvm-minimal` image
+(`SFORK_MORPH_IMAGE`, `SFORK_MORPH_VCPUS` = 2, `SFORK_MORPH_MEMORY` = 2048 MiB, `SFORK_MORPH_DISK` =
+8192 MiB). A fork is `Instance.branch(count=N)`; the branch snapshot is deleted with its last
+child. Instances stop after `SFORK_MORPH_TTL` seconds (default 3600) if a run crashes.
+
+**Tensorlake** needs `TENSORLAKE_API_KEY`, and the network must allow `api.tensorlake.ai` and
+`sandbox.tensorlake.ai`. A fork is a live `copy(times=N)`, which also works on a suspended
+checkpoint without waking it. Sizing: `SFORK_TENSORLAKE_IMAGE` (default: Tensorlake's image),
+`SFORK_TENSORLAKE_CPUS` = 1, `SFORK_TENSORLAKE_MEMORY` = 1024 MiB, `SFORK_TENSORLAKE_TIMEOUT` =
+3600 s. The free plan runs one sandbox at a time, so forking needs a credit pack.
+
+Providers we looked at and left out (November 2026): Modal (memory snapshots are alpha and stop
+the source), CodeSandbox and Freestyle (no Python SDK), Blaxel (no fork in the Python SDK), Beam
+(memory snapshots on some runtimes only, sync SDK), and Cloudflare, Northflank, Vercel, Fly and
+Runloop (no live memory fork).
 
 ## Running against Daytona
 
@@ -130,6 +150,8 @@ Phase 0 spike (creates and deletes its own VMs; results land in `bench/results/`
 ```bash
 python bench/phase0_spike.py --fake                     # dry run of the script's control flow
 python bench/phase0_spike.py                            # full sweep on E2B: RAM/disk 0/512/2048 MiB, fan-out 2/4/8, depth 10
+python bench/phase0_spike.py --backend morph            # same sweep on Morph Cloud
+python bench/phase0_spike.py --backend tensorlake       # same sweep on Tensorlake
 python bench/phase0_spike.py --backend daytona          # same sweep on Daytona VMs
 python bench/phase0_spike.py --fanout 2 4 --depth 5     # Tier 1 friendly (10 vCPU quota)
 ```
@@ -151,7 +173,7 @@ sfork finish <run>
 
 - Forking a node pauses it; the node becomes the restore point and its children carry the work.
   That keeps the tree deletable from the leaves inward, which Daytona requires (a sandbox with
-  live forks can't be deleted). On E2B, forking a paused checkpoint resumes it, forks, and pauses
-  it again.
+  live forks can't be deleted). On E2B and Morph, forking a paused checkpoint resumes it, forks,
+  and pauses it again; Tensorlake copies the suspended checkpoint directly.
 - Checkpoints are never mutated. `rewind` forks a fresh child from the checkpoint.
 - Every fork runs the guest post-fork hook before the child is handed out.
