@@ -257,7 +257,7 @@ class TensorlakeBackend:
         snaps = {s.snapshot_id for s in listed if s.snapshot_id.startswith(("copy-", "suspend-"))}
         snaps |= self._orphan_snaps
         self._orphan_snaps = set()
-        for attempt in range(20):
+        for _ in range(20):
             busy: set[str] = set()
             for snap in snaps:
                 try:
