@@ -80,6 +80,13 @@ class StubClient:
         src = self.boxes[sandbox_id]
         if src["status"] not in ("running", "suspended"):
             raise RemoteAPIError(400, f"cannot copy a {src['status']} sandbox")
+        if src["name"] and not self.unnamed_copies:
+            live = {b["name"] for b in self.boxes.values()}
+            for i in range(times):
+                if self._copy_name(src["name"], times, i) in live:
+                    raise RemoteAPIError(
+                        409, f"sandbox name '{self._copy_name(src['name'], times, i)}' is already claimed"
+                    )
         out = []
         for i in range(times):
             if self.fail_copy_index == i:
@@ -87,31 +94,52 @@ class StubClient:
                     SimpleNamespace(sandbox_id=f"bad{i}", status="failed", reason="no_capacity", name=None)
                 )
                 continue
-            name = None if self.unnamed_copies else f"{src['name']}-copy-{i}"
-            out.append(SimpleNamespace(sandbox_id=self._new(src["files"], name), status="running", name=name))
+            name = None if self.unnamed_copies or not src["name"] else self._copy_name(src["name"], times, i)
+            child = self._new(src["files"], name)
+            self.snapshots[f"copy-{sandbox_id}-{child}"] = {"files": {}, "source": sandbox_id, "pins": set()}
+            if src["status"] == "suspended":
+                self.snapshots[src["suspend_snap"]]["pins"].add(child)
+            out.append(SimpleNamespace(sandbox_id=child, status="running", name=name))
         return SimpleNamespace(source_sandbox_id=sandbox_id, sandboxes=out)
 
+    @staticmethod
+    def _copy_name(name, times, i):
+        # The real server: "<name>-copy" for one copy, "<name>-copy-1..N" for a batch.
+        return f"{name}-copy" if times == 1 else f"{name}-copy-{i + 1}"
+
     async def update_sandbox(self, sandbox_id, name=None):
-        self.calls.append(("rename", sandbox_id, name))
-        self.boxes[sandbox_id]["name"] = name
+        raise RemoteAPIError(400, "Sandbox names are immutable; set name when creating the sandbox")
 
     async def suspend(self, sandbox_id):
         box = self.boxes[sandbox_id]
         if not box["name"]:
             raise RemoteAPIError(400, "ephemeral sandboxes cannot be suspended")
         box["status"] = "suspended"
+        snap = f"suspend-{sandbox_id}-{next(self.ids)}"
+        box["suspend_snap"] = snap
+        self.snapshots[snap] = {"files": {}, "source": sandbox_id, "pins": {sandbox_id}}
 
     async def resume(self, sandbox_id):
         self.boxes[sandbox_id]["status"] = "running"
 
     async def snapshot_and_wait(self, sandbox_id, snapshot_type=None):
         self.calls.append(("snapshot", sandbox_id, str(getattr(snapshot_type, "value", snapshot_type))))
+        if self.boxes[sandbox_id]["status"] != "running":
+            raise RemoteAPIError(404, "Snapshot not found")
         sid = f"snap{next(self.ids)}"
         self.snapshots[sid] = {"files": dict(self.boxes[sandbox_id]["files"])}
         return SimpleNamespace(snapshot_id=sid)
 
     async def delete_snapshot(self, snapshot_id):
+        live = [p for p in self.snapshots[snapshot_id].get("pins", ()) if p in self.boxes]
+        if live:
+            raise RemoteAPIError(409, f"Snapshot is referenced by live sandbox '{live[0]}'")
         self.snapshots.pop(snapshot_id)
+
+    async def list_sandbox_snapshots(self, sandbox_id):
+        return [
+            SimpleNamespace(snapshot_id=k) for k, v in self.snapshots.items() if v.get("source") == sandbox_id
+        ]
 
     async def delete(self, sandbox_id):
         self.boxes.pop(sandbox_id, None)
@@ -188,14 +216,53 @@ def test_suspended_checkpoint_is_copied_without_waking(be, client):
     run(go())
 
 
-def test_unnamed_copy_is_named_before_suspend(be, client):
+def test_second_fork_of_a_parent_falls_back_to_snapshot(be, client):
+    async def go():
+        root = await be.create()
+        await be.exec(root, "write /a v1")
+        first = await be.fork(root)  # copy -> "<name>-copy"
+        second = await be.fork(root)  # name taken -> snapshot fork with a fresh name
+        batch = await be.fork_many(root, 3)  # "-copy-1..3" are free -> copy again
+        batch2 = await be.fork_many(root, 2)  # "-copy-1..2" taken -> snapshot fork
+        kids = [first, second, *batch, *batch2]
+        assert len(set(kids)) == 7
+        for k in kids:
+            assert (await be.exec(k, "read /a")).output == "v1"
+            await be.pause(k)  # every child is named, so every child can be suspended
+            assert await be.state(k) == "paused"
+        assert [c[0] for c in client.calls if c[0] in ("copy", "snapshot")] == [
+            "copy",
+            "copy",
+            "snapshot",
+            "copy",
+            "copy",
+            "snapshot",
+        ]
+        assert not [k for k in client.snapshots if not k.startswith(("copy-", "suspend-"))]
+
+    run(go())
+
+
+def test_snapshot_fork_of_a_suspended_parent_re_suspends_it(be, client):
+    async def go():
+        root = await be.create()
+        await be.exec(root, "write /a v1")
+        await be.pause(root)
+        await be.fork(root)
+        child = await be.fork(root)
+        assert (await be.exec(child, "read /a")).output == "v1"
+        assert await be.state(root) == "paused"
+
+    run(go())
+
+
+def test_pause_of_an_unnamed_sandbox_is_a_backend_error(be, client):
     async def go():
         root = await be.create()
         client.unnamed_copies = True
         child = await be.fork(root)
-        await be.pause(child)
-        assert await be.state(child) == "paused"
-        assert [c[0] for c in client.calls if c[1] == child] == ["rename"]
+        with pytest.raises(BackendError, match="cannot be suspended"):
+            await be.pause(child)
 
     run(go())
 
@@ -257,3 +324,20 @@ def test_make_backend_knows_new_providers(monkeypatch):
     monkeypatch.setattr(tl.TensorlakeBackend, "__init__", lambda self, **kw: None)
     assert type(make_backend("morph")).__name__ == "MorphBackend"
     assert type(make_backend("Tensorlake")).__name__ == "TensorlakeBackend"
+
+
+def test_delete_cleans_up_server_made_snapshots(be, client):
+    async def go():
+        root = await be.create()
+        await be.pause(root)
+        kid = await be.fork(root)  # copy of a suspended root pins root's suspend snapshot
+        grandkid = await be.fork(kid)
+        await be.pause(grandkid)
+        keep = await be.hot_snapshot(kid, "mine")
+        await be.delete(root)  # its suspend snapshot is still pinned by kid
+        assert any(k.startswith(f"suspend-{root}") for k in client.snapshots)
+        await be.delete(grandkid)
+        await be.delete(kid)  # unpins root's suspend snapshot, which is retried here
+        assert set(client.snapshots) == {keep}
+
+    run(go())
