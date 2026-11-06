@@ -13,7 +13,8 @@ How our protocol maps onto Morph Cloud (SDK `morphcloud` 0.1.116):
   every child started from it is deleted, then remove it.
 - Morph only branches ready instances, so forking a paused checkpoint resumes it, branches, and
   pauses it again (same contract as the E2B backend). Forks of one parent are serialized.
-- `pause` / `resume` -> `apause()` / `aresume()`; memory and processes survive.
+- `pause` / `resume` -> `apause()` / `aresume()`; memory and processes survive. Pause is slow
+  (about 6 s in the 2026-11-06 spike), so forking a paused checkpoint costs about 11 s.
 - `hot_snapshot` -> `asnapshot(metadata={"name": ...})`; returns the snapshot id, which `create`
   accepts in place of a template.
 - Children are independent instances, so `delete` never raises `ParentHasChildrenError`.

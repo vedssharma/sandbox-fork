@@ -9,9 +9,13 @@ log() { echo "[sfork-guest] $*" >&2; }
 
 # 1. machine-id: systemd, dbus and some telemetry key off it.
 if [ -w /etc/machine-id ] || [ -n "$SUDO" ]; then
+  old_mid=$(cat /etc/machine-id 2>/dev/null)
   if command -v systemd-machine-id-setup >/dev/null 2>&1; then
     $SUDO rm -f /etc/machine-id && $SUDO systemd-machine-id-setup >/dev/null 2>&1 || log "machine-id: setup failed"
-  else
+  fi
+  # systemd-machine-id-setup derives the id from the VM's DMI/KVM UUID when there is one, and forks
+  # share that UUID (seen on Morph), so fall back to a random id whenever the id didn't change.
+  if [ "$(cat /etc/machine-id 2>/dev/null)" = "$old_mid" ] || [ ! -s /etc/machine-id ]; then
     cat /proc/sys/kernel/random/uuid | tr -d '-' | $SUDO tee /etc/machine-id >/dev/null || log "machine-id: write failed"
   fi
 fi

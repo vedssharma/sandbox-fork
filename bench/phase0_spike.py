@@ -42,10 +42,13 @@ COUNTER = (
     ">/dev/null 2>&1 &"
 )
 # A long-lived Python process streaming PRNG output: identical streams across forks = shared PRNG state.
+# Images without python3 (Morph's morphvm-minimal) fall back to perl, which also seeds once at start.
 RNG = (
-    "nohup python3 -c 'import random,time\nwhile True:\n"
+    "if command -v python3 >/dev/null; then nohup python3 -c 'import random,time\nwhile True:\n"
     ' open("/tmp/sfork-rng","a").write(str(random.random())+"\\n"); time.sleep(0.25)\' '
-    ">/dev/null 2>&1 &"
+    '>/dev/null 2>&1 & else nohup perl -e \'srand(); $|=1; open(F, ">>", "/tmp/sfork-rng"); '
+    'select F; $|=1; while (1) { print rand(), "\\n"; select(undef,undef,undef,0.25) }\' '
+    ">/dev/null 2>&1 & fi"
 )
 IDENTITY = (
     "echo machine_id=$(cat /etc/machine-id 2>/dev/null); echo hostname=$(hostname); "
@@ -58,9 +61,12 @@ IDENTITY = (
 
 def hold_memory_cmd(mib: int) -> str:
     # Allocate and touch `mib` MiB in a background process so it is resident RAM.
+    # perl fallback for images without python3; "x" repetition writes every byte, so it is resident.
     return (
+        "if command -v python3 >/dev/null; then "
         f"nohup python3 -c 'import time; b=bytearray({mib}*1024*1024); "
-        "[b.__setitem__(i,1) for i in range(0,len(b),4096)]; time.sleep(10**9)' >/dev/null 2>&1 &"
+        "[b.__setitem__(i,1) for i in range(0,len(b),4096)]; time.sleep(10**9)' >/dev/null 2>&1 & "
+        f"else nohup perl -e '$b = \"1\" x ({mib}*1024*1024); sleep 10**9' >/dev/null 2>&1 & fi"
     )
 
 

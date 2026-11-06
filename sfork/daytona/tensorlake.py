@@ -1,7 +1,8 @@
 """Tensorlake backend.
 
 Reads TENSORLAKE_API_KEY from the environment via the SDK. The network policy must allow
-`api.tensorlake.ai` (control plane) and `sandbox.tensorlake.ai` (exec inside sandboxes).
+`api.tensorlake.ai` (control plane) and `*.sandbox.tensorlake.ai` (exec goes to
+`<sandbox-id>.sandbox.tensorlake.ai`; allowing only the bare host makes every exec fail).
 
 How our protocol maps onto Tensorlake (SDK `tensorlake` 0.5.162):
 - `fork` / `fork_many` -> `AsyncSandboxClient.copy(sandbox_id, times=N)`, a live copy that carries
