@@ -11,12 +11,26 @@
 
 Forks can nest up to `max_fork_depth`. The orchestrator can also fork the root itself before the
 agent starts (`initial_alternatives`: best-of-N with real environments).
+
+Checkpoints and rewind (PLAN.md section 4.5) work along one branch's timeline:
+
+    working node ──checkpoint──▶ checkpoint node (paused) ──▶ new working node ── risky step breaks things
+                                        │
+                                        └── rewind ──▶ fresh working node (a new fork of the checkpoint)
+                                                       conversation cut back to the checkpoint + lesson
+                                                       the broken node and everything after it deleted
+
+The agent can call `checkpoint` itself, and risky bash commands (see `sfork.agent.policy`) are
+checkpointed automatically before they run. Rewinding never mutates the checkpoint, so the agent can
+rewind to the same point again.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import shlex
 import time
 import tomllib
 from collections.abc import Callable
@@ -25,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from ..agent.llm import DEFAULT_MODEL, LLM, Usage
+from ..agent.policy import CheckpointPolicy
 from ..agent.runtime import Agent, Branch, Stop, write_file
 from ..core.budget import BudgetExceeded
 from ..core.models import NodeStatus
@@ -43,8 +58,18 @@ You can fork. When the task has a real design choice between materially differen
 you can't tell in advance which will score best, call fork with those alternatives instead of \
 guessing: each one runs in its own copy of this machine and conversation, and only the best branch \
 is kept. If you have been forked into a branch, commit to its approach.
-
+{rewind}
 Branches are ranked by: {ranking}."""
+
+REWIND_PROMPT = """
+You can step back in time. checkpoint saves the whole machine (files, databases, processes) and \
+this conversation; rewind returns to a checkpoint exactly, with everything after it undone. Risky \
+commands such as migrations and destructive SQL are checkpointed automatically just before they \
+run, and their output says which checkpoint to rewind to. So you don't need ad hoc backups. If a \
+step damages state you can't cleanly repair (data lost or corrupted, a half-applied migration, a \
+broken environment), rewind to the checkpoint before it rather than patching over the damage, and \
+write a lesson saying what to do differently.
+"""
 
 
 @dataclass
@@ -53,22 +78,28 @@ class Task:
     prompt: str
     eval: EvalConfig
     files: dict[str, str] = field(default_factory=dict)  # path relative to workdir -> content
+    # Written under FIXTURES_DIR before setup and outside git, for setup-only material (e.g. a data
+    # generator the agent shouldn't be able to re-run). Setup commands may delete them.
+    fixtures: dict[str, str] = field(default_factory=dict)
+    executable: tuple[str, ...] = ()  # files (relative to workdir) seeded with the exec bit
+    checkpoint_policy: CheckpointPolicy | None = field(default_factory=CheckpointPolicy)
 
     @classmethod
     def load(cls, path: str | Path) -> Task:
         """Load a task directory: task.md (prompt), sandbox-fork.toml (eval config), repo/ (seed files)."""
         d = Path(path)
-        repo = d / "repo"
-        files = {}
-        if repo.is_dir():
-            for f in sorted(repo.rglob("*")):
-                if f.is_file() and "__pycache__" not in f.parts:
-                    files[f.relative_to(repo).as_posix()] = f.read_text()
+        files, fixtures = _read_tree(d / "repo"), _read_tree(d / "fixtures")
+        executable = tuple(rel for rel in files if os.access(d / "repo" / rel, os.X_OK))
+        with open(d / "sandbox-fork.toml", "rb") as f:
+            raw = tomllib.load(f)
         return cls(
             name=d.name,
             prompt=(d / "task.md").read_text(),
-            eval=EvalConfig.load(d / "sandbox-fork.toml"),
+            eval=EvalConfig.from_dict(raw),
             files=files,
+            fixtures=fixtures,
+            executable=executable,
+            checkpoint_policy=CheckpointPolicy.from_config(raw.get("checkpoints")),
         )
 
     @staticmethod
@@ -90,6 +121,11 @@ class ExploreConfig:
     max_tokens: int = 16_000
     keep_head: bool = False  # leave the winning sandbox running after the run
     initial_alternatives: list[dict[str, str]] | None = None
+    checkpoints: bool = True  # give the agent checkpoint/rewind tools
+    auto_checkpoint: bool = True  # checkpoint before risky commands (needs `checkpoints`)
+    max_checkpoints: int = 8  # per run; each one keeps a paused sandbox until the run ends
+    max_rewinds: int = 4  # per branch
+    transcripts: bool = True  # include each branch's final conversation in the report
 
 
 @dataclass
@@ -114,6 +150,8 @@ class Explorer:
         self.on_event = on_event or (lambda e: None)
         self._branches: list[tuple[Branch, Stop | None]] = []
         self._fork_points: list[dict[str, Any]] = []
+        self._checkpoints: list[dict[str, Any]] = []
+        self._rewinds: list[dict[str, Any]] = []
         self.agent: Agent | None = None
 
     async def run(self, task: Task) -> dict[str, Any]:
@@ -128,7 +166,13 @@ class Explorer:
             on_event=self._emit,
             max_tokens=cfg.max_tokens,
             tool_timeout=cfg.tool_timeout_s,
-            system=SYSTEM_PROMPT.format(workdir=task.eval.workdir, ranking=", then ".join(ranking)),
+            system=SYSTEM_PROMPT.format(
+                workdir=task.eval.workdir,
+                ranking=", then ".join(ranking),
+                rewind=REWIND_PROMPT if cfg.checkpoints else "",
+            ),
+            checkpointer=self._checkpoint if cfg.checkpoints else None,
+            policy=task.checkpoint_policy if cfg.auto_checkpoint else None,
         )
         t0 = time.monotonic()
         run, root = await engine.start_run(task.prompt.strip().splitlines()[0][:200])
@@ -164,6 +208,8 @@ class Explorer:
             raise
         finally:
             report["fork_points"] = self._fork_points
+            report["checkpoints"] = self._checkpoints
+            report["rewinds"] = self._rewinds
             report["branches"] = [
                 {
                     "node": b.node_id,
@@ -171,12 +217,15 @@ class Explorer:
                     "model": b.model,
                     "steps": b.steps,
                     "tool_calls": b.tool_calls,
+                    "rewinds": b.rewinds,
                     "stop": s.kind if s else None,
                     "summary": s.summary[:1000] if s else None,
                     "usage": b.usage.as_dict(),
                 }
                 for b, s in self._branches
             ]
+            if cfg.transcripts:
+                report["transcripts"] = {b.name or "root": _jsonable(b.messages) for b, _ in self._branches}
             report["usage_by_model"] = self._usage_by_model()
             deleted = await engine.finish_run(run.id, keep_head=cfg.keep_head)
             report["tree"] = engine.render_tree(run.id)  # after teardown, so statuses are final
@@ -205,6 +254,15 @@ class Explorer:
                 stop = await asyncio.wait_for(self.agent.run(br, max_steps=max_steps), left)
             except TimeoutError:
                 stop = Stop("budget", summary=f"branch timed out after {timeout}s")
+            if stop.kind == "rewind":
+                try:
+                    await self._rewind(br, stop)
+                except (EngineError, BudgetExceeded, ValueError) as e:
+                    self._emit(
+                        {"type": "rewind_refused", "node": br.node_id, "branch": br.name, "reason": str(e)}
+                    )
+                    self.agent.resume_after_failed_rewind(br, stop, str(e))
+                continue
             if stop.kind == "fork":
                 reason = self._fork_refusal(stop, depth)
                 if reason is None:
@@ -298,6 +356,83 @@ class Explorer:
         )
         return winner
 
+    # checkpoints and rewind --------------------------------------------------------------------------
+    async def _checkpoint(self, br: Branch, label: str, auto: bool) -> str:
+        """Freeze the branch's node as a restore point and move the branch onto a fork of it."""
+        if len(self._checkpoints) >= self.cfg.max_checkpoints:
+            raise BudgetExceeded(f"this run allows at most {self.cfg.max_checkpoints} checkpoints")
+        t0 = time.monotonic()
+        cp, working = await self.engine.checkpoint(br.node_id, label)
+        secs = round(time.monotonic() - t0, 3)
+        br.node_id = working.id
+        self._checkpoints.append(
+            {
+                "checkpoint": cp.id,
+                "label": label,
+                "auto": auto,
+                "branch": br.name,
+                "step": br.steps,
+                "seconds": secs,
+            }
+        )
+        self._emit(
+            {
+                "type": "checkpointed",
+                "checkpoint": cp.id,
+                "node": working.id,
+                "branch": br.name,
+                "auto": auto,
+                "seconds": secs,
+            }
+        )
+        return cp.id
+
+    async def _rewind(self, br: Branch, stop: Stop) -> None:
+        cp_id = stop.checkpoint_id or ""
+        rec = br.find_checkpoint(cp_id)
+        if rec is None:
+            raise ValueError(f"{cp_id!r} is not a checkpoint on this branch's current timeline.")
+        if br.rewinds >= self.cfg.max_rewinds:
+            raise ValueError(f"this branch already rewound {br.rewinds} times (the limit).")
+        discard = self._child_toward(cp_id, br.node_id)
+        t0 = time.monotonic()
+        fresh = await self.engine.rewind(cp_id, discard=discard, lesson=stop.lesson or None)
+        secs = round(time.monotonic() - t0, 3)
+        abandoned = br.node_id
+        br.rewind_to(rec, node_id=fresh.id, lesson=stop.lesson)
+        self._rewinds.append(
+            {
+                "branch": br.name,
+                "checkpoint": cp_id,
+                "label": rec.label,
+                "auto_checkpoint": rec.auto,
+                "abandoned_node": abandoned,
+                "new_node": fresh.id,
+                "lesson": stop.lesson,
+                "step": br.steps,
+                "seconds": secs,
+            }
+        )
+        self._emit(
+            {
+                "type": "rewound",
+                "branch": br.name,
+                "checkpoint": cp_id,
+                "node": fresh.id,
+                "abandoned": abandoned,
+                "seconds": secs,
+            }
+        )
+
+    def _child_toward(self, ancestor_id: str, node_id: str) -> str:
+        """The child of `ancestor_id` on the path down to `node_id` (the timeline a rewind abandons)."""
+        node = self.engine.store.get_node(node_id)
+        while node.parent_id is not None and node.parent_id != ancestor_id:
+            node = self.engine.store.get_node(node.parent_id)
+        if node.parent_id != ancestor_id:
+            raise ValueError(f"checkpoint {ancestor_id} is not an ancestor of {node_id}")
+        return node.id
+
     # helpers ----------------------------------------------------------------------------------------
     @property
     def _eval_cfg(self) -> EvalConfig:
@@ -359,6 +494,9 @@ class Explorer:
             res = await write_file(lambda c, t: self._exec(node_id, c, t), f"{wd}/{rel}", content)
             if not res.ok:
                 raise EngineError(f"could not write {rel}: {res.output[-500:]}")
+        if task.executable:
+            paths = " ".join(shlex.quote(f"{wd}/{rel}") for rel in task.executable)
+            await self._exec(node_id, f"chmod +x {paths}", 60)
         # A baseline commit makes the deliverable a plain `git diff`. Skipped if git is missing.
         await self._exec(
             node_id,
@@ -369,6 +507,10 @@ class Explorer:
             ),
             120,
         )
+        for rel, content in task.fixtures.items():
+            res = await write_file(lambda c, t: self._exec(node_id, c, t), f"{FIXTURES_DIR}/{rel}", content)
+            if not res.ok:
+                raise EngineError(f"could not write fixture {rel}: {res.output[-500:]}")
         for cmd in task.eval.setup:
             res = await self._exec(node_id, in_dir(wd, cmd), 900)
             if not res.ok:
@@ -417,6 +559,32 @@ class Explorer:
 
     def _emit(self, event: dict[str, Any]) -> None:
         self.on_event({"t": round(time.time(), 3), **event})
+
+
+FIXTURES_DIR = "/tmp/sfork-fixtures"
+
+
+def _jsonable(x: Any) -> Any:
+    """SDK content blocks (pydantic models or SimpleNamespace) to plain JSON data."""
+    if isinstance(x, dict):
+        return {k: _jsonable(v) for k, v in x.items()}
+    if isinstance(x, list | tuple):
+        return [_jsonable(v) for v in x]
+    if hasattr(x, "model_dump"):
+        return x.model_dump(mode="json", exclude_none=True)
+    if hasattr(x, "__dict__"):
+        return {k: _jsonable(v) for k, v in vars(x).items()}
+    return x
+
+
+def _read_tree(root: Path) -> dict[str, str]:
+    if not root.is_dir():
+        return {}
+    return {
+        f.relative_to(root).as_posix(): f.read_text()
+        for f in sorted(root.rglob("*"))
+        if f.is_file() and "__pycache__" not in f.parts
+    }
 
 
 _GIT = "git -c user.email=sfork@localhost -c user.name=sfork -c core.pager=cat"

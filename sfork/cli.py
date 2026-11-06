@@ -206,6 +206,12 @@ def explore(
         bool, typer.Option(help="fork the root into the task's [[alternatives]] before the agent starts")
     ] = False,
     keep_head: Annotated[bool, typer.Option(help="leave the winning sandbox running")] = False,
+    checkpoints: Annotated[
+        bool, typer.Option(help="give the agent checkpoint/rewind tools (--no-checkpoints: baseline)")
+    ] = True,
+    auto_checkpoint: Annotated[
+        bool, typer.Option(help="checkpoint automatically before risky commands")
+    ] = True,
     report: Annotated[Path | None, typer.Option(help="write the JSON report here")] = None,
 ) -> None:
     """Run an agent on a task; at fork points it branches the sandbox, and the best branch wins."""
@@ -228,6 +234,8 @@ def explore(
         max_fanout=max_fanout,
         max_fork_depth=max_fork_depth,
         keep_head=keep_head,
+        checkpoints=checkpoints,
+        auto_checkpoint=auto_checkpoint,
         initial_alternatives=Task.alternatives_from(task_dir) if orchestrator_fork else None,
     )
 
@@ -270,6 +278,11 @@ def explore(
     typer.echo(rep["tree"])
     for fp in rep["fork_points"]:
         typer.echo(f"\nfork at {fp['node']} ({fp['fork_seconds']}s): {fp['why']}")
+    for rw in rep["rewinds"]:
+        typer.echo(
+            f"\nrewound {rw['branch'] or 'root'} to {rw['checkpoint']} ({rw['label']!r}, "
+            f"{rw['seconds']}s): {rw['lesson']}"
+        )
     typer.echo(
         f"\nhead: {rep.get('head_branch') or 'root'}  final: {rep.get('final_evaluation', {}).get('passed')}"
         f"/{rep.get('final_evaluation', {}).get('total')} tests"
