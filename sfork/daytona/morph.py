@@ -74,6 +74,9 @@ class MorphBackend:
         self._branch_children: dict[str, set[str]] = {}
         self._branch_of: dict[str, str] = {}  # child id -> branch snapshot id
         self._base_snapshot: str | None = None
+        # Snapshots we must never delete as a side effect of deleting a fork: the base, snapshots
+        # instances were started from, and hot snapshots (those are deleted via delete_snapshot).
+        self._protected: set[str] = set()
         self.auto_resume_paused = True
 
     # helpers ----------------------------------------------------------------
@@ -122,11 +125,13 @@ class MorphBackend:
                 ),
             )
         self._base_snapshot = snap.id
+        self._protected.add(snap.id)
         return snap.id
 
     # SandboxBackend ---------------------------------------------------------
     async def create(self, *, name: str | None = None, snapshot: str | None = None) -> str:
         snapshot_id = snapshot or await self._base()
+        self._protected.add(snapshot_id)
         meta = {**self._metadata, **({"name": name} if name else {})}
         inst = await self._retry(
             "create",
@@ -158,8 +163,12 @@ class MorphBackend:
         ids = [c.id for c in children]
         for c in children:
             self._cache[c.id] = c
-            self._branch_of[c.id] = snap.id
-        self._branch_children[snap.id] = set(ids)
+        # Morph's branch response names the snapshot the parent was started from (observed live:
+        # it is the base snapshot), not a fresh one, so only track it for cleanup when it is new.
+        if snap.id not in self._protected:
+            for cid in ids:
+                self._branch_of[cid] = snap.id
+            self._branch_children.setdefault(snap.id, set()).update(ids)
         if len(ids) != count:
             for cid in ids:
                 try:
@@ -186,6 +195,7 @@ class MorphBackend:
             "hot_snapshot", lambda: inst.asnapshot(metadata={**self._metadata, "name": name})
         )
         await self._retry("hot_snapshot", lambda: snap.await_until_ready(timeout=READY_TIMEOUT))
+        self._protected.add(snap.id)
         return snap.id
 
     async def delete_snapshot(self, name: str) -> None:
@@ -195,7 +205,10 @@ class MorphBackend:
     async def exec(self, sandbox_id: str, command: str, *, timeout: int | None = None) -> ExecResult:
         inst = await self._inst(sandbox_id)
         res = await self._retry(
-            "exec", lambda: inst.aexec(["sh", "-c", command], timeout=float(timeout) if timeout else None)
+            # Morph joins argv and runs it under `bash -c`, so the command must be one string:
+            # ["sh", "-c", cmd] would become `bash -c "sh -c cmd..."` and lose everything after word one.
+            "exec",
+            lambda: inst.aexec(command, timeout=float(timeout) if timeout else None),
         )
         return ExecResult(exit_code=res.exit_code, output=(res.stdout or "") + (res.stderr or ""))
 

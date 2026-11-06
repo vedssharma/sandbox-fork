@@ -28,15 +28,18 @@ class Cloud:
         self.calls: list[tuple] = []
         self.short_branch = False
         self.throttle = 0
+        # Real Morph (observed 2026-11-06) answers /branch with the snapshot the parent was started
+        # from rather than a new one; set False to model a fresh branch snapshot.
+        self.branch_returns_source = True
 
     def new_snapshot(self, files, digest=None):
         sid = f"snap{next(self.ids)}"
         self.snapshots[sid] = {"files": dict(files), "digest": digest}
         return StubSnapshot(self, sid)
 
-    def new_instance(self, files):
+    def new_instance(self, files, source=None):
         iid = f"inst{next(self.ids)}"
-        self.instances[iid] = {"status": "ready", "files": dict(files)}
+        self.instances[iid] = {"status": "ready", "files": dict(files), "source": source}
         return StubInstance(self, iid)
 
 
@@ -69,9 +72,13 @@ class StubInstance:
         self._c.calls.append(("branch", self.id, count))
         if self.status != "ready":
             raise ApiError(409, f"instance is {self.status}")
-        snap = self._c.new_snapshot(self._files)
+        src = self._c.instances[self.id]["source"]
+        if self._c.branch_returns_source and src in self._c.snapshots:
+            snap = StubSnapshot(self._c, src)
+        else:
+            snap = self._c.new_snapshot(self._files)
         n = count - 1 if self._c.short_branch else count
-        return snap, [self._c.new_instance(self._files) for _ in range(n)]
+        return snap, [self._c.new_instance(self._files, source=src) for _ in range(n)]
 
     async def apause(self):
         self._c.instances[self.id]["status"] = "paused"
@@ -90,8 +97,9 @@ class StubInstance:
         if self._c.throttle:
             self._c.throttle -= 1
             raise ApiError(429, "slow down")
-        assert command[:2] == ["sh", "-c"]
-        cmd = command[2]
+        # Morph runs the joined argv under bash -c, so the adapter must send one string.
+        assert isinstance(command, str), command
+        cmd = command
         if cmd.startswith("write "):
             _, path, val = cmd.split(" ", 2)
             self._files[path] = val
@@ -112,7 +120,7 @@ class StubClient:
                 self, snapshot_id, metadata=None, ttl_seconds=None, ttl_action=None, timeout=None
             ):
                 c.calls.append(("start", snapshot_id, ttl_seconds, ttl_action))
-                return c.new_instance(c.snapshots[snapshot_id]["files"])
+                return c.new_instance(c.snapshots[snapshot_id]["files"], source=snapshot_id)
 
             async def aget(self, instance_id):
                 if instance_id not in c.instances:
@@ -199,6 +207,8 @@ def test_fork_many_is_one_branch_call(be, cloud):
 
 
 def test_branch_snapshot_is_deleted_with_its_last_child(be, cloud):
+    cloud.branch_returns_source = False
+
     async def go():
         root = await be.create()
         before = set(cloud.snapshots)
@@ -208,6 +218,25 @@ def test_branch_snapshot_is_deleted_with_its_last_child(be, cloud):
         assert branch_snap in cloud.snapshots
         await be.delete(b)
         assert branch_snap not in cloud.snapshots
+
+    run(go())
+
+
+def test_deleting_forks_never_deletes_the_snapshot_the_parent_came_from(be, cloud):
+    # Regression: branch returned the base snapshot id and deleting the child deleted the base,
+    # so the next create() failed with 404 "snapshot not found".
+    async def go():
+        root = await be.create()
+        base = be._base_snapshot
+        (kid,) = await be.fork_many(root, 1)
+        await be.delete(kid)
+        assert base in cloud.snapshots
+        snap = await be.hot_snapshot(root, "cp")
+        restored = await be.create(snapshot=snap)
+        (kid2,) = await be.fork_many(restored, 1)
+        await be.delete(kid2)
+        assert snap in cloud.snapshots
+        await be.create()
 
     run(go())
 
