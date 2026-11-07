@@ -308,4 +308,4 @@ def test_billing_migration_task_loads():
     assert "load_production_copy.py" in task.fixtures
     assert "load_production_copy.py" not in task.files
     assert task.checkpoint_policy.match("./migrate.sh")
-    assert task.eval.tests.cmd == "python3 tests/test_billing.py"
+    assert task.eval.tests.cmd == "python3 tests/test_billing.py --junitxml /tmp/sfork-junit.xml"

@@ -1,13 +1,16 @@
 """Checks that 0003 was applied without changing any amount and that the app output is unchanged.
 
-Prints one JSON line {"passed": n, "total": m, "failures": [...]}. The expected values were recorded
-from the production copy before any migration ran.
+Prints one JSON line {"passed": n, "total": m, "failures": [...]}; with `--junitxml PATH` it also
+writes a JUnit report. The expected values were recorded from the production copy before any
+migration ran.
 """
 
 import hashlib
 import json
 import os
 import sys
+import time
+from xml.sax.saxutils import quoteattr
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -80,13 +83,36 @@ TESTS = [
     t_customer_balance,
 ]
 
+
+def write_junit(path, results):
+    cases = []
+    for name, secs, err in results:
+        body = "" if err is None else f"<failure message={quoteattr(err[:500])}/>"
+        cases.append(
+            f'  <testcase classname="tests.test_billing" name="{name}" time="{secs:.3f}">{body}</testcase>'
+        )
+    failed = sum(err is not None for _, _, err in results)
+    with open(path, "w") as f:
+        f.write(
+            f'<?xml version="1.0" encoding="utf-8"?>\n<testsuites><testsuite name="billing" '
+            f'tests="{len(results)}" failures="{failed}">\n'
+            + "\n".join(cases)
+            + "\n</testsuite></testsuites>\n"
+        )
+
+
 if __name__ == "__main__":
-    failures = []
+    failures, results = [], []
     for t in TESTS:
+        t0 = time.monotonic()
         try:
             t()
             print(f"ok   {t.__name__}")
+            results.append((t.__name__, time.monotonic() - t0, None))
         except Exception as e:
             failures.append(f"{t.__name__}: {e}")
+            results.append((t.__name__, time.monotonic() - t0, f"{type(e).__name__}: {e}"))
             print(f"FAIL {t.__name__}: {type(e).__name__}: {e}")
+    if "--junitxml" in sys.argv:
+        write_junit(sys.argv[sys.argv.index("--junitxml") + 1], results)
     print(json.dumps({"passed": len(TESTS) - len(failures), "total": len(TESTS), "failures": failures}))

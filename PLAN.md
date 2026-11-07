@@ -2,7 +2,7 @@
 
 **Fork-on-Action and Speculative Exploration for coding agents, built on Daytona VM sandboxes.**
 
-Status: planning (no code yet). Last updated 2026-11-05.
+Status: Phases 0-2 implemented (see README.md); Phase 3 partly (agent loop, forking, checkpoints). Last updated 2026-11-07.
 
 ---
 
@@ -175,7 +175,7 @@ Expose the same tools (plus `run`, `status`, `tree`) as an MCP server, so any MC
 
 ## 6. Evaluating and scoring branches
 
-Evaluation runs inside each branch's sandbox (so it sees that branch's DB and deps) via a per-project config file, e.g. `sandbox-fork.yaml`:
+Evaluation runs inside each branch's sandbox (so it sees that branch's DB and deps) via a per-project config file, e.g. `sandbox-fork.yaml` (implemented in `sfork/eval/`):
 
 ```yaml
 setup: ["make deps", "make db"]
