@@ -105,9 +105,11 @@ def test_agent_forks_and_best_branch_wins():
     assert by_label["wrong"]["passed"] < by_label["wrong"]["total"]
     assert by_label["slow"]["passed"] == by_label["sieve"]["passed"] == 15
     assert by_label["sieve"]["metrics"]["latency_ms"] < by_label["slow"]["metrics"]["latency_ms"]
-    assert "better benchmarks" in fp["why"]
-    # losers were deleted at promotion time, everything else at the end
-    assert len(fp["deleted_nodes"]) == 2
+    assert fp["deciding"] == "perf" and "mostly from benchmarks" in fp["why"]
+    assert fp["baseline"]["passed"] == 0  # the fork point is the unimplemented stub
+    assert fp["selection"]["winner"] == "sieve"
+    # losers and the baseline fork were deleted at the fork point, everything else at the end
+    assert len(fp["deleted_nodes"]) == 3
     assert backend.live_ids() == set()
     assert report["leftover_sandboxes"] == []
     assert "running" not in report["tree"] and "<- head" in report["tree"]

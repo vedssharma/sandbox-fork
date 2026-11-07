@@ -119,6 +119,42 @@ class TreeEngine:
             await self.gc(cp.run_id)
         return fresh
 
+    async def scratch_fork(self, node_id: str, label: str) -> Node:
+        """Fork a throwaway child of a running or paused node (e.g. to evaluate the fork point).
+
+        Unlike `fork`, the source isn't paused and the head doesn't move. Delete it with `discard`.
+        """
+        try:
+            src = self.store.get_node(node_id)
+        except KeyError:
+            raise EngineError(f"no such node {node_id!r}") from None
+        if src.status not in (NodeStatus.RUNNING, NodeStatus.PAUSED):
+            raise EngineError(f"node {node_id} is {src.status}; can only scratch-fork running or paused")
+        self.budget.check_fork(running_sandboxes=self._running_count(src.run_id), parent_depth=src.depth, n=1)
+        (child,) = await self._fork_children(src, [label], kind=NodeKind.BRANCH)
+        child.label = label
+        child.meta["scratch"] = True
+        self.store.put_node(child)
+        return child
+
+    async def discard(self, node_id: str) -> list[str]:
+        """Delete a node and its subtree now. Returns the ids deleted."""
+        # Only this subtree, leaves first, so it can't race a concurrent gc over other branches' nodes.
+        order, stack = [], [node_id]
+        while stack:
+            n = self.store.get_node(stack.pop())
+            order.append(n)
+            stack.extend(c.id for c in self.store.children(n.id))
+        deleted = []
+        for n in sorted(order, key=lambda x: -x.depth):
+            if n.status is NodeStatus.GC:
+                continue
+            self._set_status(n, NodeStatus.LOST)
+            await self.backend.delete(n.sandbox_id)
+            self._set_status(n, NodeStatus.GC)
+            deleted.append(n.id)
+        return deleted
+
     async def promote(self, node_id: str) -> list[str]:
         """Make a node the run's head and delete its competing siblings (and their subtrees)."""
         winner = self.store.get_node(node_id)

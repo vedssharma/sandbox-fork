@@ -9,7 +9,9 @@ gives checkpoints you can rewind to. See [PLAN.md](PLAN.md) for the full design 
 **Status:** Phase 0 spike, Phase 1 tree engine, and the first end-to-end loop: a Claude agent
 that forks its sandbox and conversation at a decision point, an evaluator that scores each branch on
 tests and benchmarks, and promotion of the winner (`sfork explore`), plus checkpoints the agent can
-rewind to when a step breaks something (`examples/billing_migration`).
+rewind to when a step breaks something (`examples/billing_migration`). Phase 2's evaluator scores
+branches relative to the fork point, parses JUnit, checks the diff, breaks near-ties with an LLM
+judge and stores every raw output (`sfork evaluate`, see "Evaluating branches" below).
 
 ## Layout
 
@@ -17,9 +19,11 @@ rewind to when a step breaks something (`examples/billing_migration`).
 sfork/
   core/          Run/Node models, SQLite tree store, budgets
   daytona/       SandboxBackend interface; E2B, Morph, Tensorlake, Daytona backends; FakeBackend
-  orchestrator/  TreeEngine (fork, checkpoint, rewind, promote, gc, compact) and Explorer (agent loop)
+  orchestrator/  TreeEngine (fork, checkpoint, rewind, promote, gc, compact), Explorer (agent loop),
+                 candidates (`sfork evaluate`: N prepared solutions, no agent)
   agent/         Claude tool-use loop, tools, conversation forking, scripted LLM for tests
-  eval/          sandbox-fork.toml config, gate/test/benchmark runners, lexicographic ranking
+  eval/          sandbox-fork.yaml config, gate/test/benchmark/diff/lint runners, junit parsing,
+                 baseline-relative scoring, LLM judge for near-ties, artifact storage
   guest/         post-fork hook run inside each forked VM (machine-id, RNG, hostname, clock)
   cli.py         `sfork` command
 examples/
@@ -52,10 +56,9 @@ What happens: the root sandbox is seeded with `repo/` (and a baseline git commit
 through `bash`/`read_file`/`write_file`/`run_tests`, and when it calls `fork` with 2-4 alternatives
 the engine forks the sandbox once per alternative (the parent pauses as a checkpoint) and copies the
 conversation into each child with a note naming its approach. Branches run concurrently until they
-call `done` or hit their step/time budget. The evaluator then runs the task's gates, tests and
-benchmarks in every branch and ranks them: gates first, then test pass rate, then benchmarks
-(normalized against the best branch, median of repeats), so a faster branch never beats a more
-correct one. The winner becomes the head, losers are deleted right away, and at the end the head's
+call `done` or hit their step/time budget. The evaluator then runs the task's gates, tests,
+benchmarks and diff checks in every branch, and in a throwaway fork of the fork point, and ranks
+the branches (see "Evaluating branches"). The winner becomes the head, losers are deleted right away, and at the end the head's
 `git diff` and a JSON report (tree, per-branch evaluations, why the winner won, token usage per
 model) are written to `bench/results/`. Every sandbox is deleted when the run ends, including on
 errors (`--keep-head` keeps the winner).
@@ -69,8 +72,8 @@ The Anthropic SDK honors `ANTHROPIC_BASE_URL`. Some hosted environments (includi
 cloud sessions) set it for their own use; if requests fail with an auth error there, run with
 `env -u ANTHROPIC_BASE_URL sfork explore ...`.
 
-A task directory holds `task.md` (the prompt), `sandbox-fork.toml` (eval config, see
-`sfork/eval/config.py`), `repo/` (files seeded into `workdir` and committed as the baseline) and
+A task directory holds `task.md` (the prompt), `sandbox-fork.yaml` (eval config, see
+`sfork/eval/config.py`; `.toml` works too), `repo/` (files seeded into `workdir` and committed as the baseline) and
 optionally `fixtures/` (written to `/tmp/sfork-fixtures` before `setup` runs and kept out of git, for
 setup-only material such as a data loader).
 
@@ -90,10 +93,10 @@ migration runners, destructive SQL (`DROP`, `ALTER TABLE`, `UPDATE ... SET`, `DE
 database client fed a script, `rm -r`, `git reset --hard`, force pushes. Commands that only read are
 skipped. The command's output names the checkpoint to rewind to. Configure it per task:
 
-```toml
-[checkpoints]
-auto = true                 # false: no automatic checkpoints (the tools stay)
-also_before = ['\bdeploy\b'] # extra regexes; `before = [...]` replaces the defaults
+```yaml
+checkpoints:
+  auto: true                    # false: no automatic checkpoints (the tools stay)
+  also_before: ['\bdeploy\b']   # extra regexes; `before: [...]` replaces the defaults
 ```
 
 `--no-checkpoints` removes the tools (a baseline), `--no-auto-checkpoint` keeps the tools but
@@ -110,6 +113,75 @@ every invoice of $10,000 or more gets the wrong cents, and then it drops the ori
 damage can't be repaired in place and the data generator is deleted after setup, so the agent
 rewinds to the checkpoint taken before `./migrate.sh`, fixes the cast, and applies it to the
 untouched copy.
+
+## Evaluating branches
+
+Every branch is evaluated inside its own sandbox, so the checks see that branch's files, database
+and installed packages. `sandbox-fork.yaml` says what to run (full reference in
+`sfork/eval/config.py`):
+
+```yaml
+gates:                        # must exit 0, or the branch is disqualified
+  - {name: compiles, cmd: "python3 -m py_compile app/billing.py"}
+tests:
+  cmd: python3 tests/test_billing.py --junitxml /tmp/sfork-junit.xml
+  report: junit:/tmp/sfork-junit.xml    # per-test results (or parse: json | pytest | exit)
+  repeats: 1                  # >1 for flaky suites: per-test majority, flaky tests are listed
+  regressions: gate           # a test that passed at the fork point and fails now disqualifies
+benchmarks:
+  - {name: latency_ms, cmd: python3 bench.py, parse: "json:ms", direction: lower, repeats: 3}
+quality:
+  protected: ["tests/**"]     # editing these disqualifies the branch
+  expected: ["migrations/**", "app/**"]   # files outside these count against change quality
+  lint: {cmd: "ruff check -q .", parse: lines}   # new findings since the fork point
+weights: {tests: 0.6, perf: 0.2, diff_size: 0.1, lint: 0.1}
+judge: {enabled: true, margin: 0.05}
+```
+
+How a winner is picked (`sfork/eval/scoring.py`):
+
+1. **Baseline.** While the branches run, the paused fork point is forked once more and evaluated the
+   same way, then deleted. Benchmarks are scored as an improvement ratio over it (0.5 = same as the
+   fork point, 0.67 = twice as fast, 0.91 = ten times), so numbers mean the same thing on any
+   machine. If the fork point has no number (the function didn't exist yet), branches are compared
+   with the best branch instead.
+2. **Disqualification** (score 0): a gate fails, the branch errored, it edits a protected file, or it
+   breaks a test that passed at the fork point.
+3. **Ranking:** qualified first, then test pass rate (`correctness_first`, on by default, so a
+   faster or smaller change never beats a more correct one), then the weighted score of tests,
+   performance, diff size (smallest branch wins, files outside `expected` count against it) and lint.
+   Components that don't apply to a task drop out and the weights are renormalized.
+4. **LLM judge** (optional): only when the top two qualify, pass the same tests and score within
+   `margin`. It reads the task and both diffs (not the scores), answers through a tool, and is asked
+   twice with the candidates swapped; its verdict only counts if it picks the same branch both
+   times. It's recorded next to the score, never folded into it.
+5. **Explanation:** one paragraph naming the deciding factor (disqualification, tests, perf,
+   diff_size, lint or judge) with the numbers, plus every branch's summary.
+
+Every evaluation's raw output is stored for audit next to the JSON report:
+`<report>-artifacts/<run>/<fork point>/{selection.json, baseline/, <branch>/}`, where each branch
+directory has `evaluation.json`, `tests.log`, `junit.xml`, `bench-*.log`, `gate-*.log`, `lint.log`
+and `diff.patch`.
+
+`sfork evaluate` runs the evaluator without an agent: it seeds the task, forks it once per
+candidate script in `TASK_DIR/candidates/*.sh`, runs each script in its own fork, and picks the
+winner the same way.
+
+```bash
+sfork evaluate examples/billing_migration          # 5 candidates; the judge needs ANTHROPIC_API_KEY
+sfork evaluate examples/billing_migration --no-judge
+sfork evaluate examples/count_primes               # 4 candidates, no judge
+```
+
+On E2B (2026-11-07), billing_migration's five candidates take about 45 s end to end. `as-committed`
+(the corrupting cast) and `forgot-app` (fixed cast, app still reads the dropped column) break
+`t_invoice_header`, which passed at the fork point; `loosen-tests` gets 3/3 by deleting checks and
+is disqualified for editing `tests/`. `round-cast` and `round-cast-guarded` both pass 7/7. Without
+the judge the smaller diff (`round-cast`, 15 vs 30 lines) wins; with it, the judge picks
+`round-cast-guarded` in both orders because it runs in a transaction and checks every amount
+before the irreversible `DROP COLUMN`. On count_primes the sieve beats trial division on latency
+(20 ms vs 3.7 s), `sieve-off-by-one` loses on tests, and `sieve-shrinks-bench` is disqualified for
+editing `bench.py`.
 
 ## Choosing a backend
 

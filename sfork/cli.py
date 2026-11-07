@@ -191,7 +191,7 @@ def demo() -> None:
 
 @app.command()
 def explore(
-    task_dir: Annotated[Path, typer.Argument(help="task directory: task.md, sandbox-fork.toml, repo/")],
+    task_dir: Annotated[Path, typer.Argument(help="task directory: task.md, sandbox-fork.yaml, repo/")],
     backend: Annotated[
         str | None, typer.Option(help="e2b (default) | morph | tensorlake | daytona | local (no isolation!)")
     ] = None,
@@ -213,20 +213,23 @@ def explore(
     auto_checkpoint: Annotated[
         bool, typer.Option(help="checkpoint automatically before risky commands")
     ] = True,
+    judge: Annotated[
+        bool | None, typer.Option(help="LLM judge for near-ties (default: the task config's judge.enabled)")
+    ] = None,
     report: Annotated[Path | None, typer.Option(help="write the JSON report here")] = None,
 ) -> None:
     """Run an agent on a task; at fork points it branches the sandbox, and the best branch wins."""
     import json
-    import time
 
     from .agent.llm import AnthropicLLM
     from .daytona import make_backend
     from .orchestrator.explore import ExploreConfig, Explorer, Task
 
-    task = Task.load(task_dir)
+    task = _with_judge(Task.load(task_dir), judge)
     name = (backend or os.environ.get("SFORK_BACKEND") or "e2b").lower()
     if name == "local":
         typer.secho("local backend: commands run on THIS machine, not in a sandbox", fg="yellow", err=True)
+    out = report or Path("bench/results") / f"explore-{task.name}-{_stamp()}.json"
     cfg = ExploreConfig(
         model=model,
         worker_model=worker_model,
@@ -238,6 +241,7 @@ def explore(
         checkpoints=checkpoints,
         auto_checkpoint=auto_checkpoint,
         initial_alternatives=Task.alternatives_from(task_dir) if orchestrator_fork else None,
+        artifacts_dir=str(out.with_suffix("")) + "-artifacts",
     )
 
     def show(e: dict) -> None:
@@ -268,17 +272,14 @@ def explore(
             await be.close()
 
     rep = asyncio.run(go())
-    out = (
-        report
-        or Path("bench/results")
-        / f"explore-{task.name}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
-    )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(rep, indent=2, default=str))
     typer.echo("")
     typer.echo(rep["tree"])
     for fp in rep["fork_points"]:
         typer.echo(f"\nfork at {fp['node']} ({fp['fork_seconds']}s): {fp['why']}")
+        if fp.get("artifacts"):
+            typer.echo(f"  evaluation artifacts: {fp['artifacts']}")
     for rw in rep["rewinds"]:
         typer.echo(
             f"\nrewound {rw['branch'] or 'root'} to {rw['checkpoint']} ({rw['label']!r}, "
@@ -293,6 +294,97 @@ def explore(
         f"sandboxes deleted: {rep['sandboxes_deleted']}, leftover: {rep['leftover_sandboxes'] or 'none'}"
     )
     typer.echo(f"wall: {rep['wall_seconds']}s  report: {out}")
+
+
+@app.command("evaluate")
+def evaluate_cmd(
+    task_dir: Annotated[Path, typer.Argument(help="task directory: task.md, sandbox-fork.yaml, repo/")],
+    candidates: Annotated[
+        Path | None, typer.Option(help="directory of candidate *.sh scripts (default: TASK_DIR/candidates)")
+    ] = None,
+    backend: Annotated[
+        str | None, typer.Option(help="e2b (default) | morph | tensorlake | daytona | local (no isolation!)")
+    ] = None,
+    judge: Annotated[
+        bool | None, typer.Option(help="LLM judge for near-ties (default: the task config's judge.enabled)")
+    ] = None,
+    model: Annotated[str, typer.Option(help="judge model, unless the config names one")] = "claude-opus-5-5",
+    effort: Annotated[str, typer.Option(help="judge effort")] = "medium",
+    report: Annotated[Path | None, typer.Option(help="write the JSON report here")] = None,
+) -> None:
+    """Fork the seeded task once per candidate script, evaluate every fork, and pick the winner."""
+    import json
+
+    from .daytona import make_backend
+    from .orchestrator.candidates import Candidate, evaluate_candidates
+    from .orchestrator.explore import Task
+
+    task = _with_judge(Task.load(task_dir), judge)
+    cands = Candidate.load_dir(candidates or task_dir / "candidates")
+    name = (backend or os.environ.get("SFORK_BACKEND") or "e2b").lower()
+    if name == "local":
+        typer.secho("local backend: commands run on THIS machine, not in a sandbox", fg="yellow", err=True)
+    out = report or Path("bench/results") / f"evaluate-{task.name}-{_stamp()}.json"
+
+    def show(e: dict) -> None:
+        typer.secho(f"* {e['type']}: " + json.dumps({k: v for k, v in e.items() if k != "type"}), fg="cyan")
+
+    async def go() -> dict:
+        be = make_backend(name)
+        llm = None
+        if task.eval.judge.enabled:
+            from .agent.llm import AnthropicLLM
+
+            llm = AnthropicLLM(effort=effort)
+        engine = TreeEngine(
+            TreeStore(_db_path()),
+            be,
+            budget=Budget(max_fanout=max(len(cands), 1), max_running_sandboxes=len(cands) + 2),
+            run_post_fork_hook=name != "local",
+        )
+        try:
+            return await evaluate_candidates(
+                engine,
+                task,
+                cands,
+                llm=llm,
+                model=model,
+                artifacts_dir=str(out.with_suffix("")) + "-artifacts",
+                on_event=show,
+            )
+        finally:
+            if llm is not None:
+                await llm.close()
+            await be.close()
+
+    rep = asyncio.run(go())
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rep, indent=2, default=str))
+    typer.echo("")
+    for row in rep["selection"]["ranking"]:
+        mark = "" if row["qualified"] else "  (disqualified)"
+        typer.echo(f"  {row['score']:.3f}  {row['label']}{mark}  {row['components']}")
+    typer.echo(f"\nwinner: {rep['winner']} (decided by {rep['deciding']})\n{rep['why']}")
+    typer.echo(
+        f"\nartifacts: {rep.get('artifacts')}\nleftover sandboxes: {rep['leftover_sandboxes'] or 'none'}"
+    )
+    typer.echo(f"wall: {rep['wall_seconds']}s  report: {out}")
+
+
+def _stamp() -> str:
+    import time
+
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+
+def _with_judge(task, judge: bool | None):
+    """Override the config's judge.enabled from the command line."""
+    import dataclasses
+
+    if judge is None:
+        return task
+    j = dataclasses.replace(task.eval.judge, enabled=judge)
+    return dataclasses.replace(task, eval=dataclasses.replace(task.eval, judge=j))
 
 
 if __name__ == "__main__":

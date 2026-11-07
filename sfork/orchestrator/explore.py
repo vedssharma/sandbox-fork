@@ -28,12 +28,12 @@ rewind to the same point again.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shlex
 import time
-import tomllib
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -43,8 +43,10 @@ from ..agent.policy import CheckpointPolicy
 from ..agent.runtime import Agent, Branch, Stop, write_file
 from ..core.budget import BudgetExceeded
 from ..core.models import NodeStatus
-from ..eval.config import EvalConfig
-from ..eval.evaluator import Evaluation, evaluate, explain, in_dir, rank
+from ..eval.artifacts import ArtifactStore
+from ..eval.config import EvalConfig, load_raw
+from ..eval.evaluator import BASE_TAG, Evaluation, evaluate, in_dir
+from ..eval.select import select_winner
 from .engine import EngineError, TreeEngine
 
 EventFn = Callable[[dict[str, Any]], None]
@@ -86,12 +88,11 @@ class Task:
 
     @classmethod
     def load(cls, path: str | Path) -> Task:
-        """Load a task directory: task.md (prompt), sandbox-fork.toml (eval config), repo/ (seed files)."""
+        """Load a task directory: task.md (prompt), sandbox-fork.yaml (eval config), repo/ (seed files)."""
         d = Path(path)
         files, fixtures = _read_tree(d / "repo"), _read_tree(d / "fixtures")
         executable = tuple(rel for rel in files if os.access(d / "repo" / rel, os.X_OK))
-        with open(d / "sandbox-fork.toml", "rb") as f:
-            raw = tomllib.load(f)
+        raw = load_raw(d)
         return cls(
             name=d.name,
             prompt=(d / "task.md").read_text(),
@@ -104,8 +105,7 @@ class Task:
 
     @staticmethod
     def alternatives_from(path: str | Path) -> list[dict[str, str]]:
-        with open(Path(path) / "sandbox-fork.toml", "rb") as f:
-            return list(tomllib.load(f).get("alternatives", []))
+        return list(load_raw(path).get("alternatives", []))
 
 
 @dataclass
@@ -126,6 +126,7 @@ class ExploreConfig:
     max_checkpoints: int = 8  # per run; each one keeps a paused sandbox until the run ends
     max_rewinds: int = 4  # per branch
     transcripts: bool = True  # include each branch's final conversation in the report
+    artifacts_dir: str | None = None  # store every evaluation's raw outputs here (see eval.artifacts)
 
 
 @dataclass
@@ -153,12 +154,12 @@ class Explorer:
         self._checkpoints: list[dict[str, Any]] = []
         self._rewinds: list[dict[str, Any]] = []
         self.agent: Agent | None = None
+        self._task: Task | None = None
+        self._run_id = ""
 
     async def run(self, task: Task) -> dict[str, Any]:
         cfg, engine = self.cfg, self.engine
-        ranking = ["gates pass", "test pass rate"] + [
-            f"benchmark {b.name} ({b.direction} is better)" for b in task.eval.benchmarks
-        ]
+        self._task = task
         self.agent = Agent(
             self.llm,
             self._exec,
@@ -168,7 +169,7 @@ class Explorer:
             tool_timeout=cfg.tool_timeout_s,
             system=SYSTEM_PROMPT.format(
                 workdir=task.eval.workdir,
-                ranking=", then ".join(ranking),
+                ranking=ranking_text(task.eval),
                 rewind=REWIND_PROMPT if cfg.checkpoints else "",
             ),
             checkpointer=self._checkpoint if cfg.checkpoints else None,
@@ -176,6 +177,7 @@ class Explorer:
         )
         t0 = time.monotonic()
         run, root = await engine.start_run(task.prompt.strip().splitlines()[0][:200])
+        self._run_id = run.id
         self._emit(
             {"type": "run", "run": run.id, "node": root.id, "sandbox": root.sandbox_id, "task": task.name}
         )
@@ -323,14 +325,31 @@ class Explorer:
                 self._set_stop(kb, st)
                 return Result(kb, Evaluation(node_id=kb.node_id, label=kb.name, error=st.summary), st)
 
-        results = await asyncio.gather(*(guarded(k) for k in kids))
-        ranked = rank([r.evaluation for r in results], self._eval_cfg.benchmarks)
-        wi = next(i for i, r in enumerate(results) if r.evaluation is ranked[0])
+        # The fork point itself is evaluated in a throwaway fork of the (now paused) parent, while the
+        # branches run, so scores are relative to where the branches started.
+        base_task = asyncio.create_task(self._baseline(br)) if self._eval_cfg.baseline else None
+        try:
+            results = await asyncio.gather(*(guarded(k) for k in kids))
+        finally:
+            baseline, base_deleted = await base_task if base_task else (None, [])
+        sel = await select_winner(
+            [r.evaluation for r in results],
+            self._eval_cfg,
+            baseline=baseline,
+            llm=self.llm,
+            model=self.cfg.model,
+            task=self._task.prompt if self._task else "",
+        )
+        wi = next(i for i, r in enumerate(results) if r.evaluation is sel.winner)
         winner = results[wi]
-        deleted = await self.engine.promote(children[wi].id)
+        deleted = base_deleted + await self.engine.promote(children[wi].id)
         if winner.branch.node_id != children[wi].id:  # the winner forked again; its own winner is deeper
             deleted += await self.engine.promote(winner.branch.node_id)
-        why = explain(ranked)
+        why = sel.why
+        artifacts = None
+        if self.cfg.artifacts_dir:
+            fp_name = f"fork{len(self._fork_points) + 1}-{br.name or 'root'}"
+            artifacts = str(ArtifactStore(self.cfg.artifacts_dir).save_selection(self._run_id, fp_name, sel))
         self._fork_points.append(
             {
                 "node": br.node_id,
@@ -339,9 +358,14 @@ class Explorer:
                 "alternatives": alts,
                 "children": [c.id for c in children],
                 "evaluations": [r.evaluation.as_dict() for r in results],
+                "baseline": baseline.as_dict() if baseline else None,
+                "selection": sel.as_dict(),
                 "winner": winner.branch.name,
                 "winner_node": winner.branch.node_id,
+                "deciding": sel.deciding,
                 "why": why,
+                "judge": sel.verdict.as_dict() if sel.verdict else None,
+                "artifacts": artifacts,
                 "deleted_nodes": deleted,
             }
         )
@@ -351,10 +375,40 @@ class Explorer:
                 "node": winner.branch.node_id,
                 "branch": winner.branch.name,
                 "why": why,
+                "deciding": sel.deciding,
                 "deleted": len(deleted),
             }
         )
         return winner
+
+    async def _baseline(self, br: Branch) -> tuple[Evaluation | None, list[str]]:
+        """Evaluate the fork point in a scratch fork of the paused parent, then delete the fork."""
+        try:
+            node = await self.engine.scratch_fork(br.node_id, "baseline (fork point)")
+        except Exception as e:  # no baseline: scoring falls back to comparing branches with each other
+            self._emit({"type": "baseline_skipped", "node": br.node_id, "branch": br.name, "reason": str(e)})
+            return None, []
+        ev = await evaluate(  # never raises for command or backend failures
+            lambda c, t: self.engine.backend.exec(node.sandbox_id, c, timeout=t),
+            self._eval_cfg,
+            node_id=node.id,
+            label="baseline",
+        )
+        self._emit(
+            {
+                "type": "baseline_evaluated",
+                "node": node.id,
+                "branch": br.name,
+                "summary": ev.summary(),
+                "seconds": round(ev.seconds, 2),
+            }
+        )
+        try:
+            deleted = await self.engine.discard(node.id)
+        except Exception as e:  # finish_run retries LOST nodes
+            log.warning("could not delete baseline node %s yet: %s", node.id, e)
+            deleted = []
+        return (ev if ev.error is None else None), deleted
 
     # checkpoints and rewind --------------------------------------------------------------------------
     async def _checkpoint(self, br: Branch, label: str, auto: bool) -> str:
@@ -486,35 +540,7 @@ class Explorer:
         return ev
 
     async def _seed(self, node_id: str, task: Task) -> None:
-        wd = task.eval.workdir
-        res = await self._exec(node_id, f"mkdir -p {wd}", 60)
-        if not res.ok:
-            raise EngineError(f"could not create {wd}: {res.output[-500:]}")
-        for rel, content in task.files.items():
-            res = await write_file(lambda c, t: self._exec(node_id, c, t), f"{wd}/{rel}", content)
-            if not res.ok:
-                raise EngineError(f"could not write {rel}: {res.output[-500:]}")
-        if task.executable:
-            paths = " ".join(shlex.quote(f"{wd}/{rel}") for rel in task.executable)
-            await self._exec(node_id, f"chmod +x {paths}", 60)
-        # A baseline commit makes the deliverable a plain `git diff`. Skipped if git is missing.
-        await self._exec(
-            node_id,
-            in_dir(
-                wd,
-                f"command -v git >/dev/null && git init -q && git add -A && "
-                f"{_GIT} commit -qm baseline || true",
-            ),
-            120,
-        )
-        for rel, content in task.fixtures.items():
-            res = await write_file(lambda c, t: self._exec(node_id, c, t), f"{FIXTURES_DIR}/{rel}", content)
-            if not res.ok:
-                raise EngineError(f"could not write fixture {rel}: {res.output[-500:]}")
-        for cmd in task.eval.setup:
-            res = await self._exec(node_id, in_dir(wd, cmd), 900)
-            if not res.ok:
-                raise EngineError(f"setup command failed ({cmd}): {res.output[-1000:]}")
+        await seed_task(lambda c, t: self._exec(node_id, c, t), task)
         self._emit({"type": "seeded", "node": node_id, "files": len(task.files)})
 
     async def _diff(self, node_id: str, workdir: str) -> str:
@@ -562,6 +588,68 @@ class Explorer:
 
 
 FIXTURES_DIR = "/tmp/sfork-fixtures"
+
+
+async def seed_task(exec_: Callable[[str, int], Awaitable[Any]], task: Task) -> None:
+    """Write the task's repo and fixtures into a fresh sandbox, commit + tag the baseline, run setup."""
+    wd = task.eval.workdir
+    res = await exec_(f"mkdir -p {wd}", 60)
+    if not res.ok:
+        raise EngineError(f"could not create {wd}: {res.output[-500:]}")
+    for rel, content in task.files.items():
+        res = await write_file(exec_, f"{wd}/{rel}", content)
+        if not res.ok:
+            raise EngineError(f"could not write {rel}: {res.output[-500:]}")
+    if task.executable:
+        paths = " ".join(shlex.quote(f"{wd}/{rel}") for rel in task.executable)
+        await exec_(f"chmod +x {paths}", 60)
+    # A baseline commit makes the deliverable a plain `git diff`, and the evaluator measures each
+    # branch's change against its tag. Skipped if git is missing.
+    await exec_(
+        in_dir(
+            wd,
+            f"command -v git >/dev/null && git init -q && git add -A && "
+            f"{_GIT} commit -qm baseline && git tag -f {BASE_TAG} >/dev/null || true",
+        ),
+        120,
+    )
+    for rel, content in task.fixtures.items():
+        res = await write_file(exec_, f"{FIXTURES_DIR}/{rel}", content)
+        if not res.ok:
+            raise EngineError(f"could not write fixture {rel}: {res.output[-500:]}")
+    for cmd in task.eval.setup:
+        res = await exec_(in_dir(wd, cmd), 900)
+        if not res.ok:
+            raise EngineError(f"setup command failed ({cmd}): {res.output[-1000:]}")
+
+
+log = logging.getLogger(__name__)
+
+
+def ranking_text(cfg: EvalConfig) -> str:
+    """How branches are ranked, in words, for the agent's system prompt."""
+    dq = ["all gates pass"]
+    if cfg.quality.protected:
+        dq.append(f"no edits to {', '.join(cfg.quality.protected)}")
+    if cfg.tests is not None and cfg.tests.regressions == "gate":
+        dq.append("no test that passed at the fork point may fail")
+    parts = [" and ".join(dq) + " (otherwise the branch is disqualified)"]
+    if cfg.tests is not None and cfg.correctness_first:
+        parts.append("most tests passing")
+    extra = []
+    if cfg.benchmarks:
+        extra.append(
+            "benchmarks relative to the fork point ("
+            + ", ".join(f"{b.name}, {b.direction} is better" for b in cfg.benchmarks)
+            + ")"
+        )
+    if cfg.quality.measure_diff:
+        extra.append("a small, focused diff")
+    if cfg.quality.lint is not None:
+        extra.append("no new lint findings")
+    if extra:
+        parts.append("a weighted score of " + ", ".join(extra))
+    return ", then ".join(parts)
 
 
 def _jsonable(x: Any) -> Any:

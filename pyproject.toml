@@ -9,6 +9,7 @@ dependencies = [
     "daytona>=0.202.0",
     "e2b>=2.63",
     "morphcloud>=0.1.116",
+    "pyyaml>=6",
     "tensorlake>=0.5.162",
     "typer>=0.12",
 ]
