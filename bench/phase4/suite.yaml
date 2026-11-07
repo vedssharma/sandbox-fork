@@ -1,0 +1,59 @@
+# Phase 4 benchmark suite (bench/phase4/run.py). Paths are relative to the repo root.
+# budget_usd is the hard $ cap per run, the same for every condition on a task. It is about 3x the
+# cost of a linear Opus 5.5 pilot run (rounded up, at least $0.30), so best-of-3 can afford three
+# attempts. Pilot (2026-11-07): billing 0.134, attachments 0.088, notes 0.086, count_primes 0.030,
+# flask-4045 0.076, flask-4992 0.057, flask-5063 0.093. `run.py --budget-scale` scales every cap
+# (used for the cheaper Haiku arm).
+model: claude-opus-5-5
+effort: medium
+best_of_n: 3
+max_steps: 40
+
+tasks:
+  - name: billing_migration
+    kind: stateful-migration
+    path: examples/billing_migration
+    budget_usd: 0.45
+    dirty_check: bench/phase4/checks/billing_dirty.py
+
+  - name: attachments_migration
+    kind: stateful-migration
+    path: bench/phase4/tasks/attachments_migration
+    budget_usd: 0.30
+    dirty_check: bench/phase4/checks/attachments_dirty.py
+
+  - name: notes_dep_upgrade
+    kind: dependency-upgrade
+    path: bench/phase4/tasks/notes_dep_upgrade
+    budget_usd: 0.30
+    dirty_check: bench/phase4/checks/notes_dirty.py
+
+  - name: count_primes
+    kind: design-choice
+    path: examples/count_primes
+    budget_usd: 0.15
+    # The example's task.md tells the agent to fork; the benchmark uses a neutral prompt.
+    prompt: |
+      Implement `count_primes(n)` in `primes.py`: return how many primes are <= n.
+
+      `python3 test_primes.py` checks correctness and `python3 bench.py` measures latency for n = 2,000,000. Both must keep working as they are; don't edit them. Faster is better.
+    # Solved = all tests pass and latency is under this many ms (a sieve; trial division is ~10x slower).
+    max_metric: {latency_ms: 400}
+
+  - name: pallets__flask-4045
+    kind: swe-bench-lite
+    path: bench/phase4/tasks/pallets__flask-4045
+    budget_usd: 0.30
+    swe_instance: pallets__flask-4045
+
+  - name: pallets__flask-4992
+    kind: swe-bench-lite
+    path: bench/phase4/tasks/pallets__flask-4992
+    budget_usd: 0.30
+    swe_instance: pallets__flask-4992
+
+  - name: pallets__flask-5063
+    kind: swe-bench-lite
+    path: bench/phase4/tasks/pallets__flask-5063
+    budget_usd: 0.30
+    swe_instance: pallets__flask-5063

@@ -1,0 +1,144 @@
+"""SWE-bench Lite instances as sfork tasks (PLAN.md Phase 4).
+
+`make_task(instance)` writes a task directory (task.md + sandbox-fork.yaml) that clones the repo at
+the instance's base commit and installs pinned dependencies. The agent sees only the issue. What it
+can check with `run_tests` (and what branch selection uses) is the repo's existing tests for the
+files the fix touches. The instance's hidden tests (FAIL_TO_PASS + PASS_TO_PASS, with the test patch
+applied) never go onto the machine before the run ends: `hidden_check(instance)` is a shell command
+the benchmark runs on the final head as a post-check, and the instance counts as solved only if it
+exits 0.
+
+Instances are pinned in `swe/instances.json` (rows of princeton-nlp/SWE-bench_Lite).
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import re
+import shlex
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+HERE = Path(__file__).parent
+INSTANCES = HERE / "swe" / "instances.json"
+
+# Dependency pins per (repo, version), chosen to match the release the base commit belongs to.
+PINS: dict[tuple[str, str], str] = {
+    ("pallets/flask", "2.0"): (
+        "werkzeug==2.0.3 jinja2==3.0.3 itsdangerous==2.0.1 click==8.0.4 markupsafe==2.1.1 pytest==7.4.4"
+    ),
+    ("pallets/flask", "2.3"): (
+        "werkzeug==2.3.3 jinja2==3.1.2 itsdangerous==2.1.2 click==8.1.3 blinker==1.6.2 "
+        "markupsafe==2.1.2 pytest==7.4.4"
+    ),
+}
+
+TASK_MD = """\
+Resolve this GitHub issue in the `{repo}` repository, which is checked out in /workspace at the \
+commit the issue was filed against (the package is installed in editable mode).
+
+Change the library source so the issue is resolved, in the way a maintainer would accept. Hidden \
+tests written for the fix will be run after you finish, together with the existing test suite. \
+Don't edit or add tests.
+
+<issue>
+{problem}
+</issue>
+"""
+
+
+def load_instances() -> dict[str, dict[str, Any]]:
+    return {r["instance_id"]: r for r in json.loads(INSTANCES.read_text())}
+
+
+def _test_files(patch: str) -> list[str]:
+    return sorted(set(re.findall(r"^diff --git a/(\S+) b/", patch, re.M)))
+
+
+def _tests_list(inst: dict[str, Any]) -> list[str]:
+    """FAIL_TO_PASS + PASS_TO_PASS node ids. Parametrized ids are cut back to the test function
+    (SWE-bench truncates some at spaces, so pytest can't find them); that runs every parameter."""
+    out: list[str] = []
+    for t in json.loads(inst["FAIL_TO_PASS"]) + json.loads(inst["PASS_TO_PASS"]):
+        t = t.split("[", 1)[0]
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def visible_test_files(inst: dict[str, Any]) -> list[str]:
+    """Existing test files the hidden tests live in (as of the base commit)."""
+    files = {t.split("::", 1)[0] for t in _tests_list(inst)}
+    return sorted(files)
+
+
+def eval_config(inst: dict[str, Any]) -> dict[str, Any]:
+    url = f"https://github.com/{inst['repo']}"
+    pins = PINS[(inst["repo"], inst["version"])]
+    return {
+        "workdir": "/workspace",
+        "setup": [
+            # seed_task already ran `git init` in the empty workdir; replace it with the real repo
+            f"rm -rf /workspace/.git && git clone -q {url} /tmp/src && cd /tmp/src && "
+            f"git checkout -q {inst['base_commit']} && cp -a /tmp/src/. /workspace/ && rm -rf /tmp/src",
+            "git -c advice.detachedHead=false checkout -q -B main && git tag -f sfork-base >/dev/null",
+            f"pip install -q --disable-pip-version-check {pins} >/tmp/pip.log 2>&1 || (tail -20 /tmp/pip.log; exit 1)",
+            "pip install -q --disable-pip-version-check --no-deps -e . >>/tmp/pip.log 2>&1 "
+            "|| (tail -20 /tmp/pip.log; exit 1)",
+        ],
+        "gates": [{"name": "imports", "cmd": "python3 -c 'import flask'", "timeout": 60}],
+        "tests": {
+            "cmd": "python3 -m pytest -q -p no:cacheprovider "
+            + " ".join(visible_test_files(inst))
+            + " --junitxml /tmp/sfork-junit.xml",
+            "report": "junit:/tmp/sfork-junit.xml",
+            "timeout": 600,
+            # A correct fix may legitimately break a visible test that the hidden test patch updates
+            # (flask-4045 does), so visible regressions don't disqualify.
+            "regressions": "ignore",
+        },
+        "quality": {"protected": ["tests/**"], "expected": ["src/**"]},
+        # Visible tests don't decide correctness here, so they don't dominate the ranking.
+        "correctness_first": False,
+        "weights": {"tests": 0.5, "diff_size": 0.5},
+        "judge": {"enabled": True, "margin": 0.15},
+    }
+
+
+def make_task(inst: dict[str, Any], out_dir: Path) -> Path:
+    d = out_dir / inst["instance_id"]
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "task.md").write_text(TASK_MD.format(repo=inst["repo"], problem=inst["problem_statement"].strip()))
+    (d / "sandbox-fork.yaml").write_text(
+        "# Generated by bench/phase4/swe.py from SWE-bench Lite; hidden tests are not in here.\n"
+        + yaml.safe_dump(eval_config(inst), sort_keys=False, width=100)
+    )
+    return d
+
+
+def hidden_check(inst: dict[str, Any], *, patch: str | None = None) -> str:
+    """Shell command: in a copy of the workdir, restore the test files, apply the test patch (and
+    `patch`, e.g. the gold patch for validation), and run FAIL_TO_PASS + PASS_TO_PASS. Exit 0 = solved."""
+    tp = inst["test_patch"]
+    files = " ".join(shlex.quote(f) for f in _test_files(tp))
+    b64 = base64.b64encode(tp.encode()).decode()
+    tests = " ".join(shlex.quote(t) for t in _tests_list(inst))
+    gold = ""
+    if patch is not None:
+        gold = f"echo {base64.b64encode(patch.encode()).decode()} | base64 -d > /tmp/sfork-gold.patch && git apply /tmp/sfork-gold.patch && "
+    return (
+        "rm -rf /tmp/sfork-hidden && cp -a /workspace /tmp/sfork-hidden && cd /tmp/sfork-hidden && "
+        f"git checkout -q sfork-base -- {files} 2>/dev/null; "
+        f"{gold}echo {b64} | base64 -d > /tmp/sfork-test.patch && git apply /tmp/sfork-test.patch && "
+        f"PYTHONPATH=/tmp/sfork-hidden/src python3 -m pytest -q -p no:cacheprovider -o addopts='' {tests} "
+        "2>&1 | tail -n 25; rc=${PIPESTATUS[0]}; cd / && rm -rf /tmp/sfork-hidden; exit $rc"
+    )
+
+
+if __name__ == "__main__":
+    out = HERE / "tasks"
+    for inst in load_instances().values():
+        print(make_task(inst, out))

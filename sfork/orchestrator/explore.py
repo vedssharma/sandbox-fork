@@ -42,6 +42,7 @@ from ..agent.llm import DEFAULT_MODEL, LLM, Usage
 from ..agent.policy import CheckpointPolicy
 from ..agent.runtime import Agent, Branch, Stop, write_file
 from ..core.budget import BudgetExceeded
+from ..core.cost import BudgetedLLM, CostMeter
 from ..core.models import NodeStatus
 from ..eval.artifacts import ArtifactStore
 from ..eval.config import EvalConfig, load_raw
@@ -55,13 +56,15 @@ SYSTEM_PROMPT = """\
 You are a software engineer working on a project inside a Linux sandbox, through tools. The project \
 is in {workdir} and commands run from there. Work efficiently: look at what you need, make the \
 change, check it with run_tests, then call done.
+{fork}{rewind}
+{ranked} by: {ranking}."""
 
+FORK_PROMPT = """
 You can fork. When the task has a real design choice between materially different approaches and \
 you can't tell in advance which will score best, call fork with those alternatives instead of \
 guessing: each one runs in its own copy of this machine and conversation, and only the best branch \
 is kept. If you have been forked into a branch, commit to its approach.
-{rewind}
-Branches are ranked by: {ranking}."""
+"""
 
 REWIND_PROMPT = """
 You can step back in time. checkpoint saves the whole machine (files, databases, processes) and \
@@ -127,6 +130,10 @@ class ExploreConfig:
     max_rewinds: int = 4  # per branch
     transcripts: bool = True  # include each branch's final conversation in the report
     artifacts_dir: str | None = None  # store every evaluation's raw outputs here (see eval.artifacts)
+    forking: bool = True  # give the agent the fork tool (False: a linear agent; see bench/phase4.py)
+    cost_cap_usd: float | None = None  # hard $ cap on the run's agent calls (see core.cost)
+    # name -> shell command, run in the head's workdir after the final evaluation, before teardown
+    post_checks: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -156,12 +163,16 @@ class Explorer:
         self.agent: Agent | None = None
         self._task: Task | None = None
         self._run_id = ""
+        self.meter = CostMeter(cap_usd=self.cfg.cost_cap_usd)
+        # The agent stops at the cap; the judge (a selection cost) is metered but never refused.
+        self._agent_llm = BudgetedLLM(llm, self.meter, enforce=True)
+        self._judge_llm = BudgetedLLM(llm, self.meter, enforce=False)
 
     async def run(self, task: Task) -> dict[str, Any]:
         cfg, engine = self.cfg, self.engine
         self._task = task
         self.agent = Agent(
-            self.llm,
+            self._agent_llm,
             self._exec,
             task.eval,
             on_event=self._emit,
@@ -170,10 +181,13 @@ class Explorer:
             system=SYSTEM_PROMPT.format(
                 workdir=task.eval.workdir,
                 ranking=ranking_text(task.eval),
+                fork=FORK_PROMPT if cfg.forking else "",
                 rewind=REWIND_PROMPT if cfg.checkpoints else "",
+                ranked="Branches are ranked" if cfg.forking or cfg.initial_alternatives else "Work is ranked",
             ),
             checkpointer=self._checkpoint if cfg.checkpoints else None,
             policy=task.checkpoint_policy if cfg.auto_checkpoint else None,
+            forking=cfg.forking,
         )
         t0 = time.monotonic()
         run, root = await engine.start_run(task.prompt.strip().splitlines()[0][:200])
@@ -205,6 +219,7 @@ class Explorer:
                 final_evaluation=result.evaluation.as_dict(),
                 diff=await self._diff(result.branch.node_id, task.eval.workdir),
             )
+            report["post_checks"] = await self._post_checks(result.branch.node_id, task.eval.workdir)
         except Exception as e:
             report.update(status="error", error=f"{type(e).__name__}: {e}")
             raise
@@ -229,6 +244,7 @@ class Explorer:
             if cfg.transcripts:
                 report["transcripts"] = {b.name or "root": _jsonable(b.messages) for b, _ in self._branches}
             report["usage_by_model"] = self._usage_by_model()
+            report["cost"] = self.meter.as_dict()
             deleted = await engine.finish_run(run.id, keep_head=cfg.keep_head)
             report["tree"] = engine.render_tree(run.id)  # after teardown, so statuses are final
             report["sandboxes_deleted"] = len(deleted) + sum(
@@ -336,7 +352,7 @@ class Explorer:
             [r.evaluation for r in results],
             self._eval_cfg,
             baseline=baseline,
-            llm=self.llm,
+            llm=self._judge_llm,
             model=self.cfg.model,
             task=self._task.prompt if self._task else "",
         )
@@ -555,6 +571,16 @@ class Explorer:
         )
         out = res.output if res.ok else ""
         return out if len(out) <= 40_000 else out[:40_000] + "\n...[diff truncated]"
+
+    async def _post_checks(self, node_id: str, workdir: str) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for name, cmd in self.cfg.post_checks.items():
+            try:
+                res = await self._exec(node_id, in_dir(workdir, cmd), 300)
+                out[name] = {"exit_code": res.exit_code, "output": res.output[-4000:]}
+            except Exception as e:
+                out[name] = {"exit_code": None, "output": f"{type(e).__name__}: {e}"}
+        return out
 
     async def _leftovers(self, run_id: str) -> list[str]:
         left = []

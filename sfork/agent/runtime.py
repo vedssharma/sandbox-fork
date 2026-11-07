@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from ..core.budget import BudgetExceeded
 from ..daytona.base import ExecResult
 from ..eval.config import EvalConfig
 from ..eval.evaluator import evaluate, in_dir
@@ -165,6 +166,7 @@ class Agent:
         on_event: EventFn | None = None,
         checkpointer: CheckpointFn | None = None,
         policy: CheckpointPolicy | None = None,
+        forking: bool = True,
     ) -> None:
         self.llm = llm
         self.exec = exec_fn
@@ -175,18 +177,24 @@ class Agent:
         self.on_event = on_event or (lambda e: None)
         self.checkpointer = checkpointer
         self.policy = policy if checkpointer is not None else None
-        self.tools = ALL_TOOLS if checkpointer is not None else TOOLS_WITHOUT_REWIND
+        tools = ALL_TOOLS if checkpointer is not None else TOOLS_WITHOUT_REWIND
+        # forking=False: a linear agent (or a best-of-N sample) never sees the fork tool
+        self.tools = tools if forking else [t for t in tools if t["name"] != "fork"]
 
     async def run(self, br: Branch, *, max_steps: int) -> Stop:
         nudged = False
         while br.steps < max_steps:
-            resp = await self.llm.complete(
-                model=br.model,
-                system=self.system,
-                messages=br.messages,
-                tools=self.tools,
-                max_tokens=self.max_tokens,
-            )
+            try:
+                resp = await self.llm.complete(
+                    model=br.model,
+                    system=self.system,
+                    messages=br.messages,
+                    tools=self.tools,
+                    max_tokens=self.max_tokens,
+                )
+            except BudgetExceeded as e:  # the run's $ cap (sfork.core.cost.BudgetedLLM)
+                self._emit(br, "budget", steps=br.steps, reason=str(e))
+                return Stop("budget", summary=str(e))
             br.steps += 1
             br.usage.add(resp.usage)
             br.messages.append({"role": "assistant", "content": resp.content})

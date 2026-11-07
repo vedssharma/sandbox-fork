@@ -1,0 +1,24 @@
+# Phase 4 benchmark task: a file-moving migration (see bench/phase4/README.md).
+# State lives outside the repo (SQLite at /srv/app/app.db, files under /srv/app/uploads), so git
+# can't undo a bad migration.
+workdir: /workspace
+setup:
+  - python3 /tmp/sfork-fixtures/load_production_copy.py && rm -rf /tmp/sfork-fixtures
+
+gates:
+  - {name: compiles, cmd: "python3 -m py_compile app/storage.py app/db.py", timeout: 60}
+
+tests:
+  cmd: python3 tests/test_attachments.py --junitxml /tmp/sfork-junit.xml
+  report: junit:/tmp/sfork-junit.xml
+  timeout: 300
+  regressions: gate
+
+quality:
+  protected: ["tests/**"]
+  expected: ["migrations/**", "app/**"]
+
+weights: {tests: 0.8, diff_size: 0.2}
+judge: {enabled: true, margin: 0.1}
+checkpoints:
+  auto: true
