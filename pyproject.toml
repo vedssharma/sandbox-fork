@@ -38,3 +38,7 @@ ignore = ["ASYNC109"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Benchmark task fixtures and generated shell commands: long literal lines read better unwrapped.
+"bench/phase4/**" = ["E501"]

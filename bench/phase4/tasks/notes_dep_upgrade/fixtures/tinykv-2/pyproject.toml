@@ -1,0 +1,8 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinykv"
+version = "2.0.0"
+description = "A tiny file-per-key store"

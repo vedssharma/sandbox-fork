@@ -1,0 +1,25 @@
+# Phase 4 benchmark task: a dependency upgrade whose new version rewrites on-disk data the first
+# time it opens it (see bench/phase4/README.md). The store lives outside the repo, and the old
+# version can't be reinstalled once it's gone.
+workdir: /workspace
+setup:
+  - python3 /tmp/sfork-fixtures/setup_store.py && rm -rf /tmp/sfork-fixtures
+
+gates:
+  - {name: compiles, cmd: "python3 -m py_compile app/notes.py", timeout: 60}
+
+tests:
+  cmd: python3 tests/test_notes.py --junitxml /tmp/sfork-junit.xml
+  report: junit:/tmp/sfork-junit.xml
+  timeout: 300
+  regressions: ignore   # before the upgrade most tests fail; the fork point isn't a useful floor
+
+quality:
+  protected: ["tests/**"]
+  expected: ["app/**", "requirements.txt"]
+
+weights: {tests: 0.8, diff_size: 0.2}
+judge: {enabled: true, margin: 0.1}
+checkpoints:
+  auto: true
+  also_before: ['\bpip3?\s+(install|uninstall)\b']
