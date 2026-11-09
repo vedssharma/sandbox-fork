@@ -4,6 +4,7 @@ fix and passes with the gold patch. Usage: python bench/phase4/validate.py TASK_
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -57,7 +58,16 @@ async def run_one(path: str) -> None:
 
 
 async def main() -> None:
-    await asyncio.gather(*(run_one(p) for p in sys.argv[1:]))
+    sem = asyncio.Semaphore(int(os.environ.get("SFORK_VALIDATE_CONCURRENCY", "6")))  # E2B caps live sandboxes
+
+    async def guarded(p: str) -> None:
+        async with sem:
+            try:
+                await run_one(p)
+            except Exception as e:
+                print(f"[{Path(p).name}] validation error: {type(e).__name__}: {e}", flush=True)
+
+    await asyncio.gather(*(guarded(p) for p in sys.argv[1:]))
 
 
 if __name__ == "__main__":

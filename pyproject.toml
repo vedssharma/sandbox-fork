@@ -30,6 +30,8 @@ packages = ["sfork"]
 [tool.ruff]
 line-length = 110
 target-version = "py312"
+# task prompts quote GitHub issues verbatim, code blocks included
+extend-exclude = ["bench/*/tasks/*/task.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "ASYNC"]

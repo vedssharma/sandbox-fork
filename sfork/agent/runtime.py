@@ -28,7 +28,7 @@ from ..daytona.base import ExecResult
 from ..eval.config import EvalConfig
 from ..eval.evaluator import evaluate, in_dir
 from .llm import BRANCH_TAG, LLM, Usage, block_get
-from .policy import CheckpointPolicy
+from .policy import CheckpointPolicy, changes_state
 from .tools import ALL_TOOLS, TOOLS_WITHOUT_REWIND
 
 ExecFn = Callable[[str, str, int], Awaitable[ExecResult]]  # (node_id, command, timeout)
@@ -36,6 +36,29 @@ EventFn = Callable[[dict[str, Any]], None]
 # (branch, label, auto) -> checkpoint id; moves the branch onto a fresh working node. Raises on refusal.
 CheckpointFn = Callable[["Branch", str, bool], Awaitable[str]]
 REWIND_TAG = "[sfork-rewound:"
+DECISION_NOTE = (
+    "[sfork-decision-point] Your first change was not run. This run explores alternatives before "
+    "committing: now that you have looked around, call fork with 2 or 3 materially different "
+    "approaches to the whole task (different root-cause hypotheses, places to fix it, or strategies), "
+    "each with a concrete plan. Every branch gets its own copy of this machine and conversation, an "
+    "evaluator scores them, and the best one is kept. If you truly see only one sensible approach, "
+    "fork into variants of it that differ in how they do it. Call fork now."
+)
+# Used when the agent won't fork at the decision point even after being asked twice.
+FALLBACK_ALTERNATIVES: tuple[dict[str, str], ...] = (
+    {"name": "direct", "plan": "Do the most direct fix you had in mind."},
+    {
+        "name": "root-cause",
+        "plan": "Look for the underlying cause first and fix it there, even if the change is larger.",
+    },
+    {
+        "name": "cautious",
+        "plan": (
+            "Verify every assumption (reproduce, read the relevant code paths) before changing "
+            "anything, then make the smallest safe change."
+        ),
+    },
+)
 OUTPUT_LIMIT = 12_000
 WRITE_CHUNK = 48_000
 
@@ -67,6 +90,8 @@ class Branch:
     checkpoints: list[CheckpointRecord] = field(default_factory=list)  # oldest first, this timeline only
     lessons: list[str] = field(default_factory=list)  # from every rewind so far, oldest first
     rewinds: int = 0
+    decision_prompts: int = 0  # forced-fork mode: times the first change was held back for a fork
+    decided: bool = False  # forced-fork mode: this branch has forked (or may no longer be asked to)
 
     def find_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
         return next((c for c in self.checkpoints if c.id == checkpoint_id), None)
@@ -131,8 +156,8 @@ class Branch:
         )
         if tool_use_id is not None:
             turn: list[Any] = [*pending_results, _result(tool_use_id, note)]
-        else:  # orchestrator-initiated fork: no tool call to answer
-            turn = [{"type": "text", "text": note}]
+        else:  # orchestrator-initiated fork: no tool call to answer, only the turn's other results
+            turn = [*pending_results, {"type": "text", "text": note}]
         return Branch(
             node_id=node_id,
             model=model,
@@ -167,6 +192,7 @@ class Agent:
         checkpointer: CheckpointFn | None = None,
         policy: CheckpointPolicy | None = None,
         forking: bool = True,
+        forced_fork: bool = False,
     ) -> None:
         self.llm = llm
         self.exec = exec_fn
@@ -180,6 +206,9 @@ class Agent:
         tools = ALL_TOOLS if checkpointer is not None else TOOLS_WITHOUT_REWIND
         # forking=False: a linear agent (or a best-of-N sample) never sees the fork tool
         self.tools = tools if forking else [t for t in tools if t["name"] != "fork"]
+        # Forced fork: the root branch's first state-changing tool call is held back and the agent is
+        # asked to fork into alternatives instead (see DECISION_NOTE). Needs the fork tool.
+        self.forced_fork = forced_fork and forking
 
     async def run(self, br: Branch, *, max_steps: int) -> Stop:
         nudged = False
@@ -233,6 +262,12 @@ class Agent:
                 self._emit(br, "rewind_request", checkpoint=stop.checkpoint_id, lesson=stop.lesson[:300])
                 return stop
 
+            if (held := await self._decision_point(br, uses)) is not None:
+                if isinstance(held, Stop):
+                    return held
+                br.messages.append({"role": "user", "content": held})
+                continue
+
             results: list[dict[str, Any]] = []
             fork_call = done_call = None
             for i, tu in enumerate(uses):
@@ -270,6 +305,7 @@ class Agent:
                         )
                     )
                 alts = list((block_get(fork_call, "input") or {}).get("alternatives") or [])
+                br.decided = True
                 self._emit(br, "fork_request", alternatives=[a.get("name") for a in alts])
                 return Stop(
                     "fork", alternatives=alts, tool_use_id=block_get(fork_call, "id"), pending_results=results
@@ -283,6 +319,52 @@ class Agent:
             br.messages.append({"role": "user", "content": results})
         self._emit(br, "budget", steps=br.steps)
         return Stop("budget", summary=f"stopped after {br.steps} steps")
+
+    async def _decision_point(self, br: Branch, uses: list[Any]) -> list[Any] | Stop | None:
+        """Forced-fork mode, root branch only: hold back the turn's first state-changing call.
+
+        Calls before it run normally; it and everything after it are answered "not run", and the
+        agent is told to fork into alternatives it picks. If it still hasn't forked after being asked
+        twice, the orchestrator forks for it into FALLBACK_ALTERNATIVES. Returns the user turn to
+        append, a fork Stop, or None when this turn proceeds as usual.
+        """
+        if not self.forced_fork or br.decided or br.name is not None:
+            return None
+        if any(block_get(u, "name") == "fork" for u in uses):
+            return None  # the agent forks this turn by itself
+        first = next((i for i, u in enumerate(uses) if self._changes_state(u)), None)
+        if first is None:
+            return None
+        results: list[dict[str, Any]] = []
+        for tu in uses[:first]:
+            if block_get(tu, "name") in ("checkpoint", "rewind"):
+                results.append(
+                    _result(block_get(tu, "id"), "Not run: held at the decision point.", error=True)
+                )
+            else:
+                results.append(await self._run_tool(br, tu))
+        held = [block_get(u, "id") for u in uses[first:]]
+        br.decision_prompts += 1
+        self._emit(br, "decision_point", prompts=br.decision_prompts, held=len(held))
+        if br.decision_prompts > 2:
+            br.decided = True
+            results += [_result(t, "Not run: the orchestrator forked here.", error=True) for t in held]
+            self._emit(
+                br, "fork_request", alternatives=[a["name"] for a in FALLBACK_ALTERNATIVES], forced=True
+            )
+            return Stop("fork", alternatives=list(FALLBACK_ALTERNATIVES), pending_results=results)
+        results += [_result(t, "Not run: decision point (see below).", error=True) for t in held]
+        return [*results, {"type": "text", "text": DECISION_NOTE}]
+
+    def _changes_state(self, tu: Any) -> bool:
+        name = block_get(tu, "name")
+        args = block_get(tu, "input") or {}
+        if name == "write_file":
+            path = _abs(self.eval_cfg.workdir, str(args.get("path", "")))
+            return not path.startswith("/tmp/")
+        if name == "bash":
+            return changes_state(str(args.get("command", "")))
+        return name in ("checkpoint", "done")
 
     @staticmethod
     def _just_checkpointed(br: Branch, tool_use_id: str) -> bool:
@@ -360,6 +442,12 @@ class Agent:
 
     def resume_after_failed_fork(self, br: Branch, stop: Stop, reason: str) -> None:
         """Answer a fork request that the orchestrator refused, so the branch can keep going."""
+        if stop.tool_use_id is None:  # an orchestrator-initiated fork (forced-fork fallback)
+            note = f"[sfork] The fork was refused: {reason} Continue with the approach you judge best."
+            br.messages.append(
+                {"role": "user", "content": [*stop.pending_results, {"type": "text", "text": note}]}
+            )
+            return
         br.messages.append(
             {
                 "role": "user",

@@ -234,3 +234,62 @@ def test_task_load():
     assert set(task.files) == {"primes.py", "test_primes.py", "bench.py"}
     assert task.eval.tests is not None and task.eval.benchmarks[0].direction == "lower"
     assert [a["name"] for a in Task.alternatives_from(EXAMPLE)] == ["trial-division", "sieve"]
+
+
+def test_forced_fork_holds_first_change_and_agent_forks():
+    def script(branch, turn, messages):
+        if branch is None:
+            if turn == 0:
+                return [tool_use("bash", {"command": "cat primes.py && ls"})]
+            if turn == 1:  # first change: held back at the decision point
+                return [
+                    tool_use("bash", {"command": "grep -n def primes.py"}),
+                    tool_use("write_file", {"path": "primes.py", "content": SIEVE}),
+                    tool_use("run_tests", {}),
+                ]
+            alts = [{"name": n, "plan": f"use {n}"} for n in ("slow", "sieve")]
+            return [tool_use("fork", {"alternatives": alts})]
+        return branch_script(branch, turn)
+
+    explorer, backend, llm, events = make(script, forced_fork=True)
+    report = asyncio.run(explorer.run(demo_task()))
+    assert report["head_branch"] == "sieve" and len(report["fork_points"]) == 1
+    assert [e["type"] for e in events].count("decision_point") == 1
+    root = explorer._branches[0][0]
+    held = root.messages[4]["content"]  # answers turn 1
+    assert "def count_primes" in held[0]["content"]  # the read before the change ran
+    assert all("Not run" in b["content"] for b in held[1:3])
+    assert "[sfork-decision-point]" in held[3]["text"]
+    assert "write_file" not in [e.get("name") for e in events if e["type"] == "tool" and e["branch"] is None]
+    # branches are not asked again
+    assert all(b.decision_prompts == 0 for b, _ in explorer._branches[1:])
+    for b, _ in explorer._branches:
+        assert_well_formed(b.messages)
+    assert backend.live_ids() == set()
+
+
+def test_forced_fork_falls_back_to_orchestrator_fork():
+    def script(branch, turn, messages):
+        if branch is None:  # never forks, keeps trying to write
+            return [tool_use("write_file", {"path": "primes.py", "content": SIEVE})]
+        return (
+            [tool_use("write_file", {"path": "primes.py", "content": SIEVE})]
+            if turn == 0
+            else ([tool_use("done", {"summary": "ok"})])
+        )
+
+    explorer, backend, _, events = make(script, forced_fork=True)
+    report = asyncio.run(explorer.run(demo_task()))
+    assert [e["type"] for e in events].count("decision_point") == 3
+    fp = report["fork_points"][0]
+    assert [a["name"] for a in fp["alternatives"]] == ["direct", "root-cause", "cautious"]
+    for b, _ in explorer._branches:
+        assert_well_formed(b.messages)
+    assert report["final_evaluation"]["passed"] == 15
+    assert backend.live_ids() == set()
+
+
+def test_forced_fork_off_by_default_and_without_fork_tool():
+    explorer, _, _, events = make(standard_script)
+    asyncio.run(explorer.run(demo_task()))
+    assert "decision_point" not in [e["type"] for e in events]

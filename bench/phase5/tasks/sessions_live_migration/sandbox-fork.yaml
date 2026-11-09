@@ -1,0 +1,29 @@
+# Phase 5 benchmark task: a live, in-memory migration (see bench/phase5/README.md).
+# State lives only in the service process's memory: no file, database or dump holds it, so neither
+# git nor a backup the agent didn't think of beforehand can undo a bad step.
+workdir: /workspace
+setup:
+  - pip install -q --disable-pip-version-check pytest==7.4.4 >/tmp/pip.log 2>&1 || (tail -20 /tmp/pip.log; exit 1)
+  - python3 /tmp/sfork-fixtures/make_seed.py && rm -rf /tmp/sfork-fixtures
+  - cd /workspace && (setsid nohup python3 -m app.server >/var/log/sessions.log 2>&1 &) && sleep 1
+  - for i in $(seq 50); do curl -sf http://127.0.0.1:8080/healthz >/dev/null && break; sleep 0.2; done; curl -sf http://127.0.0.1:8080/stats
+  - cd /workspace && (setsid nohup python3 -m app.traffic >/var/log/traffic.log 2>&1 &) && sleep 0.5
+
+gates:
+  - {name: service_up, cmd: "curl -sf http://127.0.0.1:8080/healthz", timeout: 30}
+
+tests:
+  cmd: python3 -m pytest -q -p no:cacheprovider tests/ --junitxml /tmp/sfork-junit.xml
+  report: junit:/tmp/sfork-junit.xml
+  timeout: 300
+  regressions: gate
+
+quality:
+  protected: ["tests/**"]
+  expected: ["migrations/**", "app/**"]
+
+weights: {tests: 0.8, diff_size: 0.2}
+judge: {enabled: true, margin: 0.1}
+checkpoints:
+  auto: true
+  also_before: ['/admin/(migrate|reload)', '\bkill\b', '\bpkill\b']
