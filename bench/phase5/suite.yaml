@@ -1,0 +1,213 @@
+# Phase 5 benchmark suite (bench/phase4/run.py --suite bench/phase5/suite.yaml).
+# Harder tasks than Phase 4: SWE-bench Verified instances rated "1-4 hours" by its annotators, and a
+# live migration whose state exists only in a running process's memory.
+# budget_usd is the hard $ cap per run, the same for every condition on a task: about 3x the most
+# expensive linear Opus 5.5 pilot run (rounded up, at least $0.30), as in Phase 4. Tasks that weren't
+# picked for the main runs keep a placeholder $0.60 cap. The main runs use --tasks with the tasks
+# linear Opus failed at least once in screening (see bench/phase5/RESULTS.md) plus
+# sessions_live_migration.
+title: Phase 5 benchmark
+model: claude-opus-5-5
+effort: medium
+best_of_n: 3
+max_steps: 50
+
+tasks:
+  - name: sessions_live_migration
+    kind: stateful-live-process
+    path: bench/phase5/tasks/sessions_live_migration
+    budget_usd: 0.30
+    dirty_check: bench/phase5/checks/sessions_dirty.py
+
+  - name: django__django-15957
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-15957
+    budget_usd: 0.60
+    swe_instance: django__django-15957
+
+  - name: django__django-16263
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-16263
+    budget_usd: 1.10
+    swe_instance: django__django-16263
+
+  - name: django__django-15128
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-15128
+    budget_usd: 0.60
+    swe_instance: django__django-15128
+
+  - name: django__django-14007
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-14007
+    budget_usd: 0.60
+    swe_instance: django__django-14007
+
+  - name: django__django-15503
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-15503
+    budget_usd: 0.60
+    swe_instance: django__django-15503
+
+  - name: django__django-16631
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-16631
+    budget_usd: 0.60
+    swe_instance: django__django-16631
+
+  - name: django__django-15268
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-15268
+    budget_usd: 0.30
+    swe_instance: django__django-15268
+
+  - name: django__django-16560
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-16560
+    budget_usd: 0.60
+    swe_instance: django__django-16560
+
+  - name: sympy__sympy-18199
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/sympy__sympy-18199
+    budget_usd: 0.30
+    swe_instance: sympy__sympy-18199
+
+  - name: sympy__sympy-17630
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/sympy__sympy-17630
+    budget_usd: 0.40
+    swe_instance: sympy__sympy-17630
+
+  - name: sympy__sympy-16597
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/sympy__sympy-16597
+    budget_usd: 0.30
+    swe_instance: sympy__sympy-16597
+
+  - name: pytest-dev__pytest-10356
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/pytest-dev__pytest-10356
+    budget_usd: 0.30
+    swe_instance: pytest-dev__pytest-10356
+
+  - name: pylint-dev__pylint-8898
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/pylint-dev__pylint-8898
+    budget_usd: 0.60
+    swe_instance: pylint-dev__pylint-8898
+
+  - name: django__django-10554
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-10554
+    budget_usd: 0.60
+    swe_instance: django__django-10554
+
+  - name: django__django-11138
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-11138
+    budget_usd: 0.60
+    swe_instance: django__django-11138
+
+  - name: django__django-11400
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-11400
+    budget_usd: 0.60
+    swe_instance: django__django-11400
+
+  - name: django__django-11885
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-11885
+    budget_usd: 0.60
+    swe_instance: django__django-11885
+
+  - name: django__django-12325
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-12325
+    budget_usd: 0.60
+    swe_instance: django__django-12325
+
+  - name: django__django-12708
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-12708
+    budget_usd: 0.60
+    swe_instance: django__django-12708
+
+  - name: django__django-13128
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-13128
+    budget_usd: 0.60
+    swe_instance: django__django-13128
+
+  - name: django__django-13344
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-13344
+    budget_usd: 0.60
+    swe_instance: django__django-13344
+
+  - name: django__django-13449
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-13449
+    budget_usd: 0.60
+    swe_instance: django__django-13449
+
+  - name: django__django-13837
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-13837
+    budget_usd: 0.60
+    swe_instance: django__django-13837
+
+  - name: django__django-14631
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-14631
+    budget_usd: 0.60
+    swe_instance: django__django-14631
+
+  - name: django__django-15629
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/django__django-15629
+    budget_usd: 0.60
+    swe_instance: django__django-15629
+
+  - name: pylint-dev__pylint-4551
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/pylint-dev__pylint-4551
+    budget_usd: 0.60
+    swe_instance: pylint-dev__pylint-4551
+
+  - name: pytest-dev__pytest-5787
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/pytest-dev__pytest-5787
+    budget_usd: 0.60
+    swe_instance: pytest-dev__pytest-5787
+
+  - name: pytest-dev__pytest-6197
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/pytest-dev__pytest-6197
+    budget_usd: 0.60
+    swe_instance: pytest-dev__pytest-6197
+
+  - name: sympy__sympy-12489
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/sympy__sympy-12489
+    budget_usd: 0.60
+    swe_instance: sympy__sympy-12489
+
+  - name: sympy__sympy-13852
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/sympy__sympy-13852
+    budget_usd: 0.30
+    swe_instance: sympy__sympy-13852
+
+  - name: sympy__sympy-13878
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/sympy__sympy-13878
+    budget_usd: 0.60
+    swe_instance: sympy__sympy-13878
+
+  - name: sympy__sympy-14248
+    kind: swe-bench-verified-hard
+    path: bench/phase5/tasks/sympy__sympy-14248
+    budget_usd: 0.60
+    swe_instance: sympy__sympy-14248
+

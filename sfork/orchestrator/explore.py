@@ -66,6 +66,11 @@ guessing: each one runs in its own copy of this machine and conversation, and on
 is kept. If you have been forked into a branch, commit to its approach.
 """
 
+FORCED_FORK_PROMPT = """\
+In this run, explore before committing: when you are about to make your first change, you will be \
+asked to fork into 2-3 materially different approaches instead.
+"""
+
 REWIND_PROMPT = """
 You can step back in time. checkpoint saves the whole machine (files, databases, processes) and \
 this conversation; rewind returns to a checkpoint exactly, with everything after it undone. Risky \
@@ -131,6 +136,8 @@ class ExploreConfig:
     transcripts: bool = True  # include each branch's final conversation in the report
     artifacts_dir: str | None = None  # store every evaluation's raw outputs here (see eval.artifacts)
     forking: bool = True  # give the agent the fork tool (False: a linear agent; see bench/phase4.py)
+    # hold back the root agent's first state-changing call and have it fork there (needs `forking`)
+    forced_fork: bool = False
     cost_cap_usd: float | None = None  # hard $ cap on the run's agent calls (see core.cost)
     # name -> shell command, run in the head's workdir after the final evaluation, before teardown
     post_checks: dict[str, str] = field(default_factory=dict)
@@ -181,13 +188,14 @@ class Explorer:
             system=SYSTEM_PROMPT.format(
                 workdir=task.eval.workdir,
                 ranking=ranking_text(task.eval),
-                fork=FORK_PROMPT if cfg.forking else "",
+                fork=(FORK_PROMPT + (FORCED_FORK_PROMPT if cfg.forced_fork else "")) if cfg.forking else "",
                 rewind=REWIND_PROMPT if cfg.checkpoints else "",
                 ranked="Branches are ranked" if cfg.forking or cfg.initial_alternatives else "Work is ranked",
             ),
             checkpointer=self._checkpoint if cfg.checkpoints else None,
             policy=task.checkpoint_policy if cfg.auto_checkpoint else None,
             forking=cfg.forking,
+            forced_fork=cfg.forced_fork,
         )
         t0 = time.monotonic()
         run, root = await engine.start_run(task.prompt.strip().splitlines()[0][:200])

@@ -51,7 +51,7 @@ from sfork.daytona import make_backend  # noqa: E402
 from sfork.orchestrator.engine import TreeEngine  # noqa: E402
 from sfork.orchestrator.explore import ExploreConfig, Explorer, Task  # noqa: E402
 
-CONDITIONS = ("linear", "best_of_n", "fork")
+CONDITIONS = ("linear", "best_of_n", "fork", "forced_fork")
 SAMPLE_PLAN = "Solve the whole task independently, your own way, as if you were the only attempt."
 
 
@@ -100,9 +100,15 @@ def explore_config(suite: dict[str, Any], spec: dict[str, Any], condition: str) 
             initial_alternatives=alts,
             max_fanout=n,
         )
-    if condition == "fork":
+    if condition in ("fork", "forced_fork"):
         return ExploreConfig(
-            **base, forking=True, checkpoints=True, auto_checkpoint=True, max_fanout=3, max_fork_depth=1
+            **base,
+            forking=True,
+            checkpoints=True,
+            auto_checkpoint=True,
+            max_fanout=3,
+            max_fork_depth=1,
+            forced_fork=condition == "forced_fork",
         )
     raise ValueError(condition)
 
@@ -140,6 +146,7 @@ def judge_solved(spec: dict[str, Any], rep: dict[str, Any]) -> dict[str, Any]:
 def summarize_run(spec: dict[str, Any], condition: str, rep_i: int, rep: dict[str, Any]) -> dict[str, Any]:
     v = judge_solved(spec, rep)
     branches = rep.get("branches") or []
+    events = rep.get("events") or []
     return {
         "task": spec["name"],
         "kind": spec.get("kind"),
@@ -154,6 +161,8 @@ def summarize_run(spec: dict[str, Any], condition: str, rep_i: int, rep: dict[st
         "forks": len(rep.get("fork_points") or []),
         "checkpoints": len(rep.get("checkpoints") or []),
         "rewinds": len(rep.get("rewinds") or []),
+        "decision_points": sum(e.get("type") == "decision_point" for e in events),
+        "fallback_forks": sum(e.get("type") == "fork_request" and bool(e.get("forced")) for e in events),
         "branches": len(branches),
         "head_branch": rep.get("head_branch"),
         "stops": [b.get("stop") for b in branches],
@@ -225,7 +234,8 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "dirty_runs": sum(bool(r["dirty"]) for r in dirty) if dirty else None,
             "stateful_runs": len(dirty) or None,
             "rewinds": sum(r["rewinds"] for r in rs),
-            "agent_fork_points": sum(r["forks"] for r in rs if r["condition"] == "fork"),
+            "agent_fork_points": sum(r["forks"] for r in rs if r["condition"] in ("fork", "forced_fork")),
+            "fallback_forks": sum(r.get("fallback_forks", 0) for r in rs),
             "hit_cap": sum(r["hit_cap"] for r in rs),
             "errors": sum(r["status"] == "error" for r in rs),
         }
@@ -243,8 +253,8 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def render_md(summary: dict[str, Any], rows: list[dict[str, Any]], meta: dict[str, Any]) -> str:
     def table(groups: dict[str, dict[str, Any]], key_name: str) -> list[str]:
         lines = [
-            f"| {key_name} | condition | solved | $ total | $ / solve | median wall (s) | dirty end state | rewinds | hit cap |",
-            "|---|---|---|---|---|---|---|---|---|",
+            f"| {key_name} | condition | solved | $ total | $ / solve | median wall (s) | dirty end state | rewinds | forks | hit cap |",
+            "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for k, conds in groups.items():
             for c, a in conds.items():
@@ -254,12 +264,12 @@ def render_md(summary: dict[str, Any], rows: list[dict[str, Any]], meta: dict[st
                 lines.append(
                     f"| {k} | {c} | {a['solved']}/{a['runs']} | {a['cost_usd']:.2f} | "
                     f"{'-' if a['usd_per_solve'] is None else f'{a["usd_per_solve"]:.3f}'} | "
-                    f"{a['median_wall_s']} | {dirty} | {a['rewinds']} | {a['hit_cap']} |"
+                    f"{a['median_wall_s']} | {dirty} | {a['rewinds']} | {a['agent_fork_points']} | {a['hit_cap']} |"
                 )
         return lines
 
     out = [
-        "# Phase 4 benchmark summary",
+        f"# {meta.get('title', 'Benchmark')} summary",
         "",
         f"Model {meta['model']} (effort {meta['effort']}), best-of-{meta['best_of_n']}, "
         f"{meta['repeats']} repeat(s), E2B. Total spend ${meta['total_usd']:.2f}.",
@@ -356,6 +366,7 @@ async def main() -> None:
     )
     summary = aggregate(rows)
     meta = {
+        "title": suite.get("title", "Phase 4 benchmark"),
         "model": suite.get("model"),
         "effort": suite.get("effort"),
         "best_of_n": suite.get("best_of_n"),

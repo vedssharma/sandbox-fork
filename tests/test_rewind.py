@@ -309,3 +309,28 @@ def test_billing_migration_task_loads():
     assert "load_production_copy.py" not in task.files
     assert task.checkpoint_policy.match("./migrate.sh")
     assert task.eval.tests.cmd == "python3 tests/test_billing.py --junitxml /tmp/sfork-junit.xml"
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("cat foo.py && grep -rn x src/", False),
+        ("python3 -m pytest tests/x.py -q", False),
+        ("python3 /tmp/repro.py 2>&1 | tail", False),
+        ("cat > /tmp/r.py <<'EOF'\nprint(1)\nEOF", False),
+        ("git diff; git log --oneline", False),
+        ("curl -s localhost:8080/stats", False),
+        ("sed -i 's/a/b/' src/x.py", True),
+        ("echo hi > src/x.py", True),
+        ("git checkout -- x", True),
+        ("pip install foo", True),
+        ("psql -c 'select 1'", True),
+        ("kill -HUP 12", True),
+        ("./migrate.sh 0004", True),
+        ("python3 - <<'EOF'\nfrom pathlib import Path\nPath('a.py').write_text('x')\nEOF", True),
+    ],
+)
+def test_changes_state_heuristic(command, expected):
+    from sfork.agent.policy import changes_state
+
+    assert changes_state(command) is expected

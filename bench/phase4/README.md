@@ -8,6 +8,7 @@ conditions, at the same hard $ cap per run on each task:
 | `linear` | one agent, plain tools (bash, read/write file, run_tests, done). No fork, no checkpoint/rewind. |
 | `best_of_n` | the orchestrator forks the seeded sandbox N=3 ways before the agent starts; three linear agents run in parallel; the evaluator keeps the best. The cap is shared. |
 | `fork` | one agent with the fork tool and checkpoint/rewind, plus automatic checkpoints before risky commands. The cap is shared by all branches. |
+| `forced_fork` | as `fork`, but the agent must fork at its first change (added in Phase 5; see `bench/phase5/README.md`). |
 
 Same model, effort, step limit (40 turns per branch) and evaluator in every condition. The cap is
 enforced by `sfork.core.cost.BudgetedLLM`: once a run's spend reaches it, no new model call starts

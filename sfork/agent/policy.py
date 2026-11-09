@@ -75,3 +75,46 @@ class CheckpointPolicy:
             ):
                 return " ".join(part.split())
         return None
+
+
+# The first change an agent makes is the forced-fork decision point (see sfork.agent.runtime).
+# Commands that write files, install packages, or touch databases or processes count as changes;
+# reading, searching, running tests and scratch work under /tmp don't.
+_MUTATORS = re.compile(
+    r"^\s*(sudo\s+)?(sed\s+(-\w*i|--in-place)|patch|git\s+(apply|am|checkout|commit|stash|restore|switch|merge|rebase|rm|mv)|"
+    r"mv|cp|rm|mkdir|touch|tee|chmod|chown|ln|install|truncate|dd|"
+    r"(pip3?|uv|apt|apt-get|npm|python3?\s+-m\s+pip)\s+(install|uninstall|remove|add)|"
+    r"psql|mysql|sqlite3|redis-cli|systemctl|service|kill|killall|pkill)\b"
+)
+_PY_WRITE = re.compile(
+    r"write_text\(|write_bytes\(|\.write\(|open\([^)]*,\s*['\"][wa]|os\.(remove|rename|replace)\(|shutil\."
+)
+_REDIRECT = re.compile(r"(?<![0-9&<])>>?\s*([^\s|;&<>]+)")
+
+
+def changes_state(command: str) -> bool:
+    """Heuristic: does this shell command (probably) change files outside /tmp, packages, databases
+    or processes?"""
+    if CheckpointPolicy().match(command):
+        return True
+    if re.search(r"\bpython3?\b", command) and _PY_WRITE.search(command):
+        return True  # an inline script that writes files
+    text = _HEREDOC.sub(lambda m: f"<<{m.group(2)}{m.group(3)}", command)
+    for part in _CHAIN.split(text):
+        if not part.strip():
+            continue
+        targets = [t for t in _REDIRECT.findall(part) if t != "/dev/null" and not t.startswith("&")]
+        if any(not t.startswith("/tmp/") for t in targets):
+            return True
+        m = _MUTATORS.match(part)
+        if m is None:
+            continue
+        args = [a for a in part[m.end() :].split() if not a.startswith("-")]
+        if (
+            args
+            and all(a.strip("'\"").startswith("/tmp/") for a in args if "/" in a or "." in a)
+            and any("/" in a for a in args)
+        ):
+            continue  # scratch work under /tmp
+        return True
+    return False
