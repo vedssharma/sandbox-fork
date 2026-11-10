@@ -1,0 +1,31 @@
+# Phase 7 benchmark task: an online resize of a closed-source in-memory session daemon whose bug
+# only shows when it runs. The sessions exist only in the daemon's memory and it has no dump command,
+# so nothing the agent can do beforehand backs them up (see bench/phase7/README.md).
+workdir: /workspace
+setup:
+  - pip install -q --disable-pip-version-check pytest==7.4.4 >/tmp/pip.log 2>&1 || (tail -20 /tmp/pip.log; exit 1)
+  - cd /tmp/sfork-fixtures && gcc -O2 -s -o sessiond sessiond.c && sudo install -m 755 sessiond /usr/local/bin/sessiond
+  - sudo mkdir -p /var/lib/sessiond /var/lib/sfork-check && sudo chown user:user /var/lib/sessiond
+  - python3 /tmp/sfork-fixtures/make_seed.py && sudo mv /tmp/sessions-check.json /var/lib/sfork-check/sessions.json
+  - (setsid nohup sessiond --seed /var/lib/sessiond/seed.txt >/var/lib/sessiond/sessiond.log 2>&1 &) && sleep 1
+  - for i in $(seq 50); do /workspace/bin/sessctl ping >/dev/null 2>&1 && break; sleep 0.2; done; /workspace/bin/sessctl stats
+  - cd /workspace && (setsid nohup python3 tools/traffic.py >/var/lib/sessiond/traffic.log 2>&1 &) && sleep 0.5
+  - rm -rf /tmp/sfork-fixtures
+
+gates:
+  - {name: daemon_up, cmd: "/workspace/bin/sessctl ping", timeout: 30}
+
+tests:
+  cmd: python3 -m pytest -q -p no:cacheprovider tests/ --junitxml /tmp/sfork-junit.xml
+  report: junit:/tmp/sfork-junit.xml
+  timeout: 300
+  regressions: gate
+
+quality:
+  protected: ["tests/**"]
+
+weights: {tests: 0.9, diff_size: 0.1}
+judge: {enabled: true, margin: 0.1}
+checkpoints:
+  auto: true
+  also_before: ['\bsessctl\b.*\bresize\b', '\bRESIZE\b', '\bkill\b', '\bpkill\b']

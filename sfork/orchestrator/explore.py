@@ -56,7 +56,7 @@ SYSTEM_PROMPT = """\
 You are a software engineer working on a project inside a Linux sandbox, through tools. The project \
 is in {workdir} and commands run from there. Work efficiently: look at what you need, make the \
 change, check it with run_tests, then call done.
-{fork}{rewind}
+{fork}{rewind}{note}
 {ranked} by: {ranking}."""
 
 FORK_PROMPT = """
@@ -138,6 +138,7 @@ class ExploreConfig:
     forking: bool = True  # give the agent the fork tool (False: a linear agent; see bench/phase4.py)
     # hold back the root agent's first state-changing call and have it fork there (needs `forking`)
     forced_fork: bool = False
+    system_note: str = ""  # appended to the agent's system prompt (bench controls, e.g. phase 7)
     cost_cap_usd: float | None = None  # hard $ cap on the run's agent calls (see core.cost)
     # name -> shell command, run in the head's workdir after the final evaluation, before teardown
     post_checks: dict[str, str] = field(default_factory=dict)
@@ -190,6 +191,7 @@ class Explorer:
                 ranking=ranking_text(task.eval),
                 fork=(FORK_PROMPT + (FORCED_FORK_PROMPT if cfg.forced_fork else "")) if cfg.forking else "",
                 rewind=REWIND_PROMPT if cfg.checkpoints else "",
+                note=("\n" + cfg.system_note.strip() + "\n") if cfg.system_note else "",
                 ranked="Branches are ranked" if cfg.forking or cfg.initial_alternatives else "Work is ranked",
             ),
             checkpointer=self._checkpoint if cfg.checkpoints else None,

@@ -1,0 +1,22 @@
+# Phase 7 benchmark suite (bench/phase4/run.py --suite bench/phase7/suite.yaml).
+# Stateful tasks where the damage only shows when a closed-source tool runs, and the state can't be
+# backed up beforehand (disk too full to copy it; sessions only in a daemon's memory, no dump).
+# budget_usd is the hard $ cap per run, the same for every condition on a task (see RESULTS.md).
+title: Phase 7 benchmark (runtime-only damage)
+model: claude-opus-5-5
+effort: medium
+best_of_n: 3
+max_steps: 50
+
+tasks:
+  - name: tsdb_retention
+    kind: stateful-runtime-only
+    path: bench/phase7/tasks/tsdb_retention
+    budget_usd: 1.00
+    dirty_check: bench/phase7/checks/tsdb_dirty.py
+
+  - name: sessiond_resize
+    kind: stateful-runtime-only
+    path: bench/phase7/tasks/sessiond_resize
+    budget_usd: 1.00
+    dirty_check: bench/phase7/checks/sessiond_dirty.py

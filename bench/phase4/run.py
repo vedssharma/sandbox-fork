@@ -51,7 +51,12 @@ from sfork.daytona import make_backend  # noqa: E402
 from sfork.orchestrator.engine import TreeEngine  # noqa: E402
 from sfork.orchestrator.explore import ExploreConfig, Explorer, Task  # noqa: E402
 
-CONDITIONS = ("linear", "best_of_n", "fork", "forced_fork")
+CONDITIONS = ("linear", "best_of_n", "fork", "forced_fork", "linear_careful")
+# Phase 7 control: a linear agent told what the rewind prompt tells it about risk, without the tools.
+CAREFUL_NOTE = (
+    "Some commands can damage state you can't cleanly repair (data lost or corrupted, a half-applied "
+    "migration, a broken environment), and nothing on this machine can undo them for you."
+)
 SAMPLE_PLAN = "Solve the whole task independently, your own way, as if you were the only attempt."
 
 
@@ -89,6 +94,10 @@ def explore_config(suite: dict[str, Any], spec: dict[str, Any], condition: str) 
     )
     if condition == "linear":
         return ExploreConfig(**base, forking=False, checkpoints=False, auto_checkpoint=False)
+    if condition == "linear_careful":
+        return ExploreConfig(
+            **base, forking=False, checkpoints=False, auto_checkpoint=False, system_note=CAREFUL_NOTE
+        )
     if condition == "best_of_n":
         n = int(suite.get("best_of_n", 3))
         alts = [{"name": f"sample-{i + 1}", "plan": SAMPLE_PLAN} for i in range(n)]
