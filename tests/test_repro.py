@@ -7,17 +7,21 @@ writer's checks catch it and the repro selector picks the slower, correct branch
 
 import asyncio
 
+from test_explore import SIEVE, SLOW_SIEVE, demo_task, make
+
 from sfork.agent.llm import text, tool_use
 from sfork.eval.repro import ReproResult, parse
 from sfork.eval.scoring import Signal
-from test_explore import SIEVE, SLOW_SIEVE, demo_task, make
 
 FAST_BUT_WRONG = SIEVE.replace("return sum(s)", "return sum(s) + (1 if n == 12345 else 0)")
 IMPLS = {"fastwrong": FAST_BUT_WRONG, "slowright": SLOW_SIEVE}
+ORACLE = "from primes import count_primes; assert count_primes(12345) == 1474"
 REPRO_DIR = "/workspace/.git/sfork_repro"  # LocalBackend shares /tmp between "sandboxes"
 
 RUN_SH = """\
-check() { if timeout 60 python3 -c "$2" >/dev/null 2>&1; then echo "REPRO $1 PASS"; else echo "REPRO $1 FAIL"; fi; }
+check() {
+  if timeout 60 python3 -c "$2" >/dev/null 2>&1; then echo "REPRO $1 PASS"; else echo "REPRO $1 FAIL"; fi
+}
 check primes_12345 'from primes import count_primes; assert count_primes(12345) == 1474'
 check primes_10 'from primes import count_primes; assert count_primes(10) == 4'
 check module_imports 'import primes'
@@ -39,7 +43,10 @@ def script(branch, turn, messages):
         return [tool_use("done", {"summary": "3 checks"})]
     impl = IMPLS[branch]
     if turn == 0:
-        return [text(f"Implementing {branch}."), tool_use("write_file", {"path": "primes.py", "content": impl})]
+        return [
+            text(f"Implementing {branch}."),
+            tool_use("write_file", {"path": "primes.py", "content": impl}),
+        ]
     return [tool_use("done", {"summary": f"{branch} implemented"})]
 
 
@@ -52,7 +59,7 @@ def test_repro_selector_overrides_benchmarks_and_records_default_pick():
         initial_alternatives=ALTS,
         selector="repro",
         repro_dir=REPRO_DIR,
-        branch_checks={"oracle": "python3 -c 'from primes import count_primes; assert count_primes(12345) == 1474'"},
+        branch_checks={"oracle": f"python3 -c '{ORACLE}'"},
     )
     report = asyncio.run(explorer.run(demo_task()))
     assert report["status"] == "ok"
