@@ -27,7 +27,7 @@ about 0.6 s, and a rewind 1 to 5 s with running processes intact.
 
 ## 1. What was built
 
-All code is in this repository (`sfork/`). Phases 6 and 7 live in open PRs #12 and #13.
+All code is in this repository (`sfork/`). Phase 7 lives in PR #13.
 
 | Piece | What it does | Where |
 |---|---|---|
