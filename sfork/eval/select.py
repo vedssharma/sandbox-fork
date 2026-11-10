@@ -8,7 +8,7 @@ from ..agent.llm import LLM
 from .config import EvalConfig
 from .evaluator import Evaluation
 from .judge import judge
-from .scoring import Selection, explain, near_tie, rank
+from .scoring import Selection, Signal, explain, near_tie, rank
 
 
 async def select_winner(
@@ -19,14 +19,19 @@ async def select_winner(
     llm: LLM | None = None,
     model: str | None = None,
     task: str = "",
+    signal: Signal | None = None,
 ) -> Selection:
-    ranked = rank(evals, cfg, baseline)
+    """Rank, let the judge break a near-tie between the top two, explain.
+
+    `signal` (optional) is an extra correctness signal ranked right after the gates (see Signal).
+    """
+    ranked = rank(evals, cfg, baseline, signal)
     verdict = None
     if (
         cfg.judge.enabled
         and llm is not None
         and len(ranked) >= 2
-        and near_tie(ranked[0], ranked[1], cfg)
+        and near_tie(ranked[0], ranked[1], cfg, signal)
         and (cfg.judge.model or model)
     ):
         verdict = await judge(
@@ -39,8 +44,10 @@ async def select_winner(
         )
         if verdict.applied and verdict.preferred == ranked[1].node_id:
             ranked[0], ranked[1] = ranked[1], ranked[0]
-    why, deciding = explain(ranked, cfg, baseline=baseline, verdict=verdict)
-    return Selection(ranked=ranked, why=why, deciding=deciding, baseline=baseline, verdict=verdict)
+    why, deciding = explain(ranked, cfg, baseline=baseline, verdict=verdict, signal=signal)
+    return Selection(
+        ranked=ranked, why=why, deciding=deciding, baseline=baseline, verdict=verdict, signal=signal
+    )
 
 
 __all__ = ["select_winner"]

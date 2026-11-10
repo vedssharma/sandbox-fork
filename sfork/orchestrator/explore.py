@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import posixpath
 import re
 import shlex
 import time
@@ -47,6 +48,7 @@ from ..core.models import NodeStatus
 from ..eval.artifacts import ArtifactStore
 from ..eval.config import EvalConfig, load_raw
 from ..eval.evaluator import BASE_TAG, Evaluation, evaluate, in_dir
+from ..eval.repro import MAX_BUNDLE_BYTES, REPRO_DIR, WRITER_PROMPT, WRITER_SYSTEM, ReproResult, parse
 from ..eval.select import select_winner
 from .engine import EngineError, TreeEngine
 
@@ -141,6 +143,18 @@ class ExploreConfig:
     cost_cap_usd: float | None = None  # hard $ cap on the run's agent calls (see core.cost)
     # name -> shell command, run in the head's workdir after the final evaluation, before teardown
     post_checks: dict[str, str] = field(default_factory=dict)
+    # How a fork point picks its winner. "default": gates, tests, score, judge on near-ties.
+    # "repro": a writer agent writes reproduction checks from the task while the branches work (see
+    # sfork.eval.repro); they rank right after the gates. The default selector's pick is recorded too.
+    selector: str = "default"
+    repro_model: str | None = None  # defaults to `model`
+    repro_max_steps: int = 25
+    repro_cap_usd: float = 0.30  # the writer's own hard cap, separate from cost_cap_usd
+    repro_dir: str = REPRO_DIR  # where the checks live on every machine (outside the project)
+    # name -> shell command run in EVERY branch at each fork point before losers are deleted, recorded
+    # next to that branch's evaluation and never used for selection (e.g. hidden tests, to measure
+    # how often a selector picks a correct branch when one exists)
+    branch_checks: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -174,6 +188,10 @@ class Explorer:
         # The agent stops at the cap; the judge (a selection cost) is metered but never refused.
         self._agent_llm = BudgetedLLM(llm, self.meter, enforce=True)
         self._judge_llm = BudgetedLLM(llm, self.meter, enforce=False)
+        # Selection-time agents (the repro writer) are metered apart, so they never eat into the
+        # branches' cap; reports add the two up.
+        self.selection_meter = CostMeter()
+        self._repro: list[dict[str, Any]] = []
 
     async def run(self, task: Task) -> dict[str, Any]:
         cfg, engine = self.cfg, self.engine
@@ -253,6 +271,9 @@ class Explorer:
                 report["transcripts"] = {b.name or "root": _jsonable(b.messages) for b, _ in self._branches}
             report["usage_by_model"] = self._usage_by_model()
             report["cost"] = self.meter.as_dict()
+            report["selection_cost"] = self.selection_meter.as_dict()
+            if self._repro:
+                report["repro_transcripts"] = self._repro
             deleted = await engine.finish_run(run.id, keep_head=cfg.keep_head)
             report["tree"] = engine.render_tree(run.id)  # after teardown, so statuses are final
             report["sandboxes_deleted"] = len(deleted) + sum(
@@ -352,18 +373,56 @@ class Explorer:
         # The fork point itself is evaluated in a throwaway fork of the (now paused) parent, while the
         # branches run, so scores are relative to where the branches started.
         base_task = asyncio.create_task(self._baseline(br)) if self._eval_cfg.baseline else None
+        writer_task = asyncio.create_task(self._write_repro(br)) if self.cfg.selector == "repro" else None
         try:
             results = await asyncio.gather(*(guarded(k) for k in kids))
         finally:
             baseline, base_deleted = await base_task if base_task else (None, [])
-        sel = await select_winner(
-            [r.evaluation for r in results],
-            self._eval_cfg,
-            baseline=baseline,
-            llm=self._judge_llm,
-            model=self.cfg.model,
-            task=self._task.prompt if self._task else "",
-        )
+        repro: ReproResult | None = None
+        oracle: dict[str, dict[str, dict[str, Any]]] = {}
+
+        async def run_oracle(r: Result) -> None:
+            if self.cfg.branch_checks and r.evaluation.error is None:
+                oracle[r.branch.node_id] = await self._checks(
+                    r.branch.node_id, self._eval_cfg.workdir, self.cfg.branch_checks
+                )
+
+        if writer_task is not None:
+            repro, writer_node = await writer_task
+            try:
+                if repro.ok:
+                    await self._run_repro(repro, results, writer_node)
+            finally:
+                if writer_node is not None:
+                    base_deleted += await self._discard(writer_node)
+        # after the repro checks, so the two don't compete for the sandboxes' CPUs
+        await asyncio.gather(*(run_oracle(r) for r in results))
+        evals = [r.evaluation for r in results]
+        task_text = self._task.prompt if self._task else ""
+        default_sel = None
+        signal = repro.signal() if repro is not None else None
+        if self.cfg.selector == "repro":
+            # what the default selector would have picked, on the same branches (recorded only)
+            default_sel = await select_winner(
+                evals,
+                self._eval_cfg,
+                baseline=baseline,
+                llm=self._judge_llm,
+                model=self.cfg.model,
+                task=task_text,
+            )
+        if default_sel is not None and signal is None:
+            sel = default_sel  # nothing usable from the writer: fall back to the default selector
+        else:
+            sel = await select_winner(
+                evals,
+                self._eval_cfg,
+                baseline=baseline,
+                llm=self._judge_llm,
+                model=self.cfg.model,
+                task=task_text,
+                signal=signal,
+            )
         wi = next(i for i, r in enumerate(results) if r.evaluation is sel.winner)
         winner = results[wi]
         deleted = base_deleted + await self.engine.promote(children[wi].id)
@@ -381,7 +440,12 @@ class Explorer:
                 "fork_seconds": fork_s,
                 "alternatives": alts,
                 "children": [c.id for c in children],
-                "evaluations": [r.evaluation.as_dict() for r in results],
+                "evaluations": [
+                    {**r.evaluation.as_dict(), "branch_checks": oracle.get(r.branch.node_id)} for r in results
+                ],
+                "selector": self.cfg.selector,
+                "repro": repro.as_dict() if repro is not None else None,
+                "default_selection": default_sel.as_dict() if default_sel is not None else None,
                 "baseline": baseline.as_dict() if baseline else None,
                 "selection": sel.as_dict(),
                 "winner": winner.branch.name,
@@ -433,6 +497,165 @@ class Explorer:
             log.warning("could not delete baseline node %s yet: %s", node.id, e)
             deleted = []
         return (ev if ev.error is None else None), deleted
+
+    # reproduction checks (selector "repro") ----------------------------------------------------------
+    async def _write_repro(self, br: Branch) -> tuple[ReproResult, str | None]:
+        """Have a writer agent write reproduction checks in a scratch fork of the fork point.
+
+        Returns the result and the scratch node (kept alive so the checks can be re-run there as
+        the fork point's reference; the caller discards it). Never raises.
+        """
+        out = ReproResult()
+        t0 = time.monotonic()
+        try:
+            node = await self.engine.scratch_fork(br.node_id, "repro writer")
+        except Exception as e:
+            out.reason = f"no scratch fork: {e}"
+            self._emit({"type": "repro_skipped", "node": br.node_id, "reason": out.reason})
+            return out, None
+        wd, rdir = self._eval_cfg.workdir, self.cfg.repro_dir.rstrip("/")
+        parent, base = (shlex.quote(x) for x in posixpath.split(rdir))
+        meter = CostMeter(cap_usd=self.cfg.repro_cap_usd)
+        model = self.cfg.repro_model or self.cfg.model
+        writer = Agent(
+            _TeeLLM(self.llm, meter, self.selection_meter),
+            self._exec,
+            self._eval_cfg,
+            on_event=self._emit,
+            max_tokens=self.cfg.max_tokens,
+            tool_timeout=self.cfg.tool_timeout_s,
+            system=WRITER_SYSTEM.format(workdir=wd, repro_dir=rdir),
+            forking=False,
+        )
+        writer.tools = [t for t in writer.tools if t["name"] in ("bash", "read_file", "write_file", "done")]
+        wb = Branch(
+            node_id=node.id,
+            model=model,
+            name=f"repro-writer@{br.name or 'root'}",
+            messages=[
+                {
+                    "role": "user",
+                    "content": WRITER_PROMPT.format(task=self._task.prompt if self._task else ""),
+                }
+            ],
+        )
+        try:
+            stop = await asyncio.wait_for(
+                writer.run(wb, max_steps=self.cfg.repro_max_steps), self.cfg.branch_timeout_s
+            )
+            out.summary = stop.summary
+            q = shlex.quote(rdir)
+            res = await self._exec(
+                node.id,
+                f"test -f {q}/run.sh && cd {parent} && find {base} -type f -not -name '*.pyc' | head -200",
+                60,
+            )
+            if not res.ok or not res.output.strip():
+                out.reason = f"the writer left no {rdir}/run.sh"
+            else:
+                out.files = res.output.split()
+                res = await self._exec(
+                    node.id,
+                    f"cd {parent} && tar czf - --exclude='*.pyc' --exclude=__pycache__ {base} | base64 -w0",
+                    60,
+                )
+                out.bundle_b64 = res.output.strip() if res.ok else ""
+                out.bundle_bytes = len(out.bundle_b64)
+                cat = await self._exec(node.id, f"cat {q}/run.sh", 60)
+                out.run_sh = cat.output if cat.ok else ""
+                if not out.bundle_b64:
+                    out.reason = f"could not pack {rdir}: {res.output[-300:]}"
+                elif out.bundle_bytes > MAX_BUNDLE_BYTES:
+                    out.reason = f"{rdir} is too big ({out.bundle_bytes} bytes base64)"
+                else:
+                    out.ok = True
+        except Exception as e:
+            out.reason = f"writer failed: {type(e).__name__}: {e}"
+        out.writer_cost_usd = meter.spent_usd
+        out.writer_steps = wb.steps
+        out.writer_seconds = time.monotonic() - t0
+        self._repro.append({"branch": wb.name, "messages": _jsonable(wb.messages)})
+        self._emit(
+            {
+                "type": "repro_written",
+                "node": br.node_id,
+                "ok": out.ok,
+                "reason": out.reason,
+                "files": out.files[:20],
+                "cost_usd": round(out.writer_cost_usd, 4),
+            }
+        )
+        return out, node.id
+
+    async def _run_repro(self, repro: ReproResult, results: list[Result], writer_node: str | None) -> None:
+        """Run the checks at the fork point (the writer's copy) and in every branch, concurrently."""
+        t0 = time.monotonic()
+        wd, rdir = self._eval_cfg.workdir, self.cfg.repro_dir.rstrip("/")
+        parent = shlex.quote(posixpath.dirname(rdir))
+        bundle = f"{rdir}.tgz.b64"
+        install = (
+            f"rm -rf {shlex.quote(rdir)} && mkdir -p {parent} && "
+            f"base64 -d {shlex.quote(bundle)} | tar xzf - -C {parent}"
+        )
+        run = f"timeout 600 bash {shlex.quote(rdir)}/run.sh 2>&1 | tail -c 20000"
+
+        async def one(node_id: str, *, fresh: bool) -> str:
+            try:
+                if fresh:
+                    w = await write_file(lambda c, t: self._exec(node_id, c, t), bundle, repro.bundle_b64)
+                    if not w.ok:
+                        return f"(install failed: {w.output[-300:]})"
+                    res = await self._exec(node_id, install, 120)
+                    if not res.ok:
+                        return f"(install failed: {res.output[-300:]})"
+                res = await self._exec(node_id, in_dir(wd, run), 900)
+                return res.output
+            except Exception as e:
+                return f"({type(e).__name__}: {e})"
+
+        targets = [
+            (r.branch.node_id, r.branch.name or r.branch.node_id)
+            for r in results
+            if r.evaluation.error is None
+        ]
+        outs = await asyncio.gather(
+            *(one(nid, fresh=True) for nid, _ in targets),
+            *([one(writer_node, fresh=False)] if writer_node else []),
+        )
+        for (nid, label), o in zip(targets, outs, strict=False):
+            repro.branches[nid] = parse(o)
+            repro.outputs[nid] = o[-3000:]
+            repro.labels[nid] = label
+        if writer_node:
+            repro.fork_point_output = outs[-1]
+            repro.fork_point = parse(outs[-1])
+        repro.run_seconds = time.monotonic() - t0
+        self._emit(
+            {
+                "type": "repro_ran",
+                "fork_point": f"{sum(repro.fork_point.values())}/{len(repro.fork_point)}",
+                "branches": {
+                    repro.labels[n]: f"{repro.passed(n)}/{len(repro.checks)}" for n in repro.branches
+                },
+            }
+        )
+
+    async def _discard(self, node_id: str) -> list[str]:
+        try:
+            return await self.engine.discard(node_id)
+        except Exception as e:  # finish_run retries LOST nodes
+            log.warning("could not delete scratch node %s yet: %s", node_id, e)
+            return []
+
+    async def _checks(self, node_id: str, workdir: str, checks: dict[str, str]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for name, cmd in checks.items():
+            try:
+                res = await self._exec(node_id, in_dir(workdir, cmd), 900)
+                out[name] = {"exit_code": res.exit_code, "output": res.output[-4000:]}
+            except Exception as e:
+                out[name] = {"exit_code": None, "output": f"{type(e).__name__}: {e}"}
+        return out
 
     # checkpoints and rewind --------------------------------------------------------------------------
     async def _checkpoint(self, br: Branch, label: str, auto: bool) -> str:
@@ -684,6 +907,24 @@ def ranking_text(cfg: EvalConfig) -> str:
     if extra:
         parts.append("a weighted score of " + ", ".join(extra))
     return ", then ".join(parts)
+
+
+class _TeeLLM:
+    """Meters each call on two meters; refuses calls once the first (capped) one is exhausted."""
+
+    def __init__(self, inner: Any, capped: CostMeter, total: CostMeter) -> None:
+        self._capped = BudgetedLLM(inner, capped, enforce=True)
+        self.total = total
+
+    async def complete(self, **kw: Any) -> Any:
+        before = self._capped.meter.spent_usd
+        resp = await self._capped.complete(**kw)
+        spent = self._capped.meter.spent_usd - before
+        self.total.spent_usd += spent
+        self.total.calls += 1
+        m = getattr(resp, "model", None) or kw.get("model", "")
+        self.total.by_model[m] = self.total.by_model.get(m, 0.0) + spent
+        return resp
 
 
 def _jsonable(x: Any) -> Any:

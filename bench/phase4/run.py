@@ -51,7 +51,7 @@ from sfork.daytona import make_backend  # noqa: E402
 from sfork.orchestrator.engine import TreeEngine  # noqa: E402
 from sfork.orchestrator.explore import ExploreConfig, Explorer, Task  # noqa: E402
 
-CONDITIONS = ("linear", "best_of_n", "fork", "forced_fork")
+CONDITIONS = ("linear", "best_of_n", "fork", "forced_fork", "best_of_n_repro", "forced_fork_repro")
 SAMPLE_PLAN = "Solve the whole task independently, your own way, as if you were the only attempt."
 
 
@@ -77,6 +77,16 @@ def post_checks(spec: dict[str, Any]) -> dict[str, str]:
 
 
 def explore_config(suite: dict[str, Any], spec: dict[str, Any], condition: str) -> ExploreConfig:
+    """`<condition>_repro` (Phase 6): the same condition with the reproduction-check selector, plus
+    the hidden tests run in every branch at each fork point (recorded only, never used to select)."""
+    if condition.endswith("_repro"):
+        cfg = explore_config(suite, spec, condition.removesuffix("_repro"))
+        cfg.selector = "repro"
+        cfg.repro_cap_usd = float(suite.get("repro_cap_usd", 0.30))
+        cfg.repro_max_steps = int(suite.get("repro_max_steps", 25))
+        if spec.get("swe_instance"):
+            cfg.branch_checks = {"hidden_tests": hidden_check(load_instances()[spec["swe_instance"]])}
+        return cfg
     steps = int(suite.get("max_steps", 40))
     base = dict(
         model=suite.get("model", "claude-opus-5-5"),
@@ -143,17 +153,58 @@ def judge_solved(spec: dict[str, Any], rep: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def selection_stats(rep: dict[str, Any]) -> dict[str, Any]:
+    """Phase 6: at the (first) fork point, did the selectors pick a hidden-test-passing branch?
+
+    Needs branch_checks (the `_repro` conditions). `default_*` is what the default selector picked on
+    the same branches (recorded by the repro selector), `repro_*` what the repro selector picked.
+    """
+    fps = [fp for fp in rep.get("fork_points") or [] if fp.get("selector") == "repro"]
+    if not fps:
+        return {}
+    fp = fps[0]
+    ok = {
+        e["node_id"]: (e.get("branch_checks") or {}).get("hidden_tests", {}).get("exit_code") == 0
+        for e in fp.get("evaluations") or []
+    }
+    repro = fp.get("repro") or {}
+    default = (fp.get("default_selection") or fp.get("selection") or {}).get("winner_node")
+    return {
+        "fp_branches": len(ok),
+        "fp_correct_branches": sum(ok.values()),
+        "fp_any_correct": any(ok.values()),
+        "default_pick_ok": ok.get(default, False),
+        "repro_pick_ok": ok.get((fp.get("selection") or {}).get("winner_node"), False),
+        "picks_differ": default != (fp.get("selection") or {}).get("winner_node"),
+        "repro_ok": repro.get("ok"),
+        "repro_checks": len(repro.get("checks") or []),
+        "repro_failing_at_fork_point": repro.get("failing_at_fork_point"),
+        "repro_writer_usd": repro.get("writer_cost_usd"),
+        "deciding": fp.get("deciding"),
+        "default_deciding": (fp.get("default_selection") or {}).get("deciding"),
+    }
+
+
 def summarize_run(spec: dict[str, Any], condition: str, rep_i: int, rep: dict[str, Any]) -> dict[str, Any]:
     v = judge_solved(spec, rep)
     branches = rep.get("branches") or []
     events = rep.get("events") or []
+    sel_usd = (rep.get("selection_cost") or {}).get("spent_usd") or 0.0
+    agent_usd = (rep.get("cost") or {}).get("spent_usd")
+    stats = selection_stats(rep)
+    if stats:  # would the run have been solved with the default selector's pick?
+        stats["solved_default"] = (
+            bool(v["solved"]) if not stats["picks_differ"] else bool(stats["default_pick_ok"])
+        )
     return {
         "task": spec["name"],
         "kind": spec.get("kind"),
         "condition": condition,
         "rep": rep_i,
         **v,
-        "cost_usd": (rep.get("cost") or {}).get("spent_usd"),
+        # the agents' spend (capped) plus selection-time agents (the repro writer; uncapped by the run cap)
+        "cost_usd": None if agent_usd is None else round(agent_usd + sel_usd, 5),
+        "selection_usd": sel_usd,
         "cap_usd": (rep.get("cost") or {}).get("cap_usd"),
         "hit_cap": bool((rep.get("cost") or {}).get("refused_calls")),
         "wall_s": rep.get("wall_seconds"),
@@ -168,6 +219,7 @@ def summarize_run(spec: dict[str, Any], condition: str, rep_i: int, rep: dict[st
         "stops": [b.get("stop") for b in branches],
         "leftover_sandboxes": rep.get("leftover_sandboxes"),
         "error": rep.get("error"),
+        **stats,
     }
 
 
