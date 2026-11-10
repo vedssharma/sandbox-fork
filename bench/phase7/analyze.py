@@ -31,7 +31,11 @@ STORE = "/var/lib/tsdb"
 
 
 def commands(rep: dict) -> list[str]:
-    cmds = [e.get("arg", "") for e in rep.get("events") or [] if e.get("type") == "tool" and e.get("name") == "bash"]
+    cmds = [
+        e.get("arg", "")
+        for e in rep.get("events") or []
+        if e.get("type") == "tool" and e.get("name") == "bash"
+    ]
     for tr in (rep.get("transcripts") or {}).values():
         for m in tr if isinstance(tr, list) else tr.get("messages", []):
             if isinstance(m.get("content"), list):
@@ -128,12 +132,20 @@ def table(rows: list[dict], keys: tuple[str, ...]) -> list[str]:
     for g, rs in sorted(groups.items()):
         clean = sum(r["clean"] for r in rs)
         cost = sum(r["cost"] for r in rs)
-        out.append(
-            "| " + " | ".join(str(x) for x in g) + f" | {len(rs)} | {clean} | {sum(r['tests_pass'] for r in rs)} | "
-            f"{sum(r['dirty'] for r in rs)} | {sum(r['rehearsed'] for r in rs)} | {sum(r['live_trap'] for r in rs)} | "
-            f"{sum(r['rewinds'] > 0 for r in rs)} | {cost:.2f} | {cost / clean if clean else float('nan'):.3f} | "
-            f"{sum(r['hit_cap'] for r in rs)} |"
-        )
+        cells = [
+            *g,
+            len(rs),
+            clean,
+            sum(r["tests_pass"] for r in rs),
+            sum(r["dirty"] for r in rs),
+            sum(r["rehearsed"] for r in rs),
+            sum(r["live_trap"] for r in rs),
+            sum(r["rewinds"] > 0 for r in rs),
+            f"{cost:.2f}",
+            f"{cost / clean:.3f}" if clean else "n/a",
+            sum(r["hit_cap"] for r in rs),
+        ]
+        out.append("| " + " | ".join(str(c) for c in cells) + " |")
     return out
 
 
@@ -152,16 +164,28 @@ def main() -> None:
         "",
         "## Runs",
         "",
-        "| model | task | condition | rep | clean | tests | dirty (lost) | rehearsed | trap live | rewinds | ckpts | $ | cap | wall s |",
+        "| model | task | condition | rep | clean | tests | dirty (lost) | rehearsed | trap live | rewinds "
+        "| ckpts | $ | cap | wall s |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in sorted(rows, key=lambda r: (r["model"] or "", r["task"], r["condition"], r["rep"])):
-        lines.append(
-            f"| {r['model']} | {r['task']} | {r['condition']} | {r['rep']} | {'yes' if r['clean'] else 'no'} | "
-            f"{'pass' if r['tests_pass'] else 'fail'} | {'yes (' + str(r['lost']) + ')' if r['dirty'] else 'no'} | "
-            f"{'yes' if r['rehearsed'] else 'no'} | {'yes' if r['live_trap'] else 'no'} | {r['rewinds']} | "
-            f"{r['checkpoints']} | {r['cost']:.3f} | {'yes' if r['hit_cap'] else ''} | {r['wall']} |"
-        )
+        cells = [
+            r["model"],
+            r["task"],
+            r["condition"],
+            r["rep"],
+            "yes" if r["clean"] else "no",
+            "pass" if r["tests_pass"] else "fail",
+            f"yes ({r['lost']})" if r["dirty"] else "no",
+            "yes" if r["rehearsed"] else "no",
+            "yes" if r["live_trap"] else "no",
+            r["rewinds"],
+            r["checkpoints"],
+            f"{r['cost']:.3f}",
+            "yes" if r["hit_cap"] else "",
+            r["wall"],
+        ]
+        lines.append("| " + " | ".join(str(c) for c in cells) + " |")
     print("\n".join(lines))
 
 

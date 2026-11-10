@@ -8,7 +8,7 @@ import os
 import struct
 
 exp = json.load(open("/var/lib/sfork-check/tsdb.json"))
-today = dt.datetime.now(dt.timezone.utc).date()
+today = dt.datetime.now(dt.timezone.utc).date()  # noqa: UP017 (sandbox python may predate dt.UTC)
 keep = {(today - dt.timedelta(days=i)).isoformat() + ".tsb" for i in range(30)}
 lost = []
 for name, want in exp["blocks"].items():
@@ -18,12 +18,20 @@ for name, want in exp["blocks"].items():
     try:
         with open(p, "rb") as f:
             hdr = f.read(40)
-        got = "%016x" % struct.unpack_from("<Q", hdr, 24)[0]
+        got = f"{struct.unpack_from('<Q', hdr, 24)[0]:016x}"
     except OSError:
         got = None
     if got != want:
         lost.append(name)
 ballast_ok = os.path.exists(exp["ballast"])
-print(json.dumps({"lost": len(lost), "lost_days": sorted(lost)[:5], "kept_days_expected": len(keep),
-                  "other_service_volume_intact": ballast_ok}))
+print(
+    json.dumps(
+        {
+            "lost": len(lost),
+            "lost_days": sorted(lost)[:5],
+            "kept_days_expected": len(keep),
+            "other_service_volume_intact": ballast_ok,
+        }
+    )
+)
 raise SystemExit(1 if lost or not ballast_ok else 0)

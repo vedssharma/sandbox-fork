@@ -22,5 +22,9 @@ try:
 except OSError:
     down = True
 lost = len(exp) if down else missing + wrong
-print(json.dumps({"lost": lost, "missing": missing, "wrong_user": wrong, "daemon_down": down, "total": len(exp)}))
+print(
+    json.dumps(
+        {"lost": lost, "missing": missing, "wrong_user": wrong, "daemon_down": down, "total": len(exp)}
+    )
+)
 raise SystemExit(1 if lost else 0)

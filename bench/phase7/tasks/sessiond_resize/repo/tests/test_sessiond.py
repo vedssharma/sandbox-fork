@@ -24,7 +24,7 @@ def stats():
 
 def test_known_sessions_intact():
     replies = ask([f"GET {t}" for t in KNOWN])
-    bad = [t for (t, u), r in zip(KNOWN.items(), replies) if not r.startswith(f"OK {u} ")]
+    bad = [t for (t, u), r in zip(KNOWN.items(), replies, strict=True) if not r.startswith(f"OK {u} ")]
     assert not bad, f"{len(bad)} of {len(KNOWN)} known sessions are missing or wrong"
 
 

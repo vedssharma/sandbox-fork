@@ -1,4 +1,5 @@
 """Setup only (deleted afterwards): turn tsdbgen's output into the post-run check's expectations."""
+
 import json
 import sys
 

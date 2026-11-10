@@ -38,7 +38,8 @@ def runner(sb):
 
 async def run_script(sb, task: Task, script: Path, label: str) -> None:
     ex = runner(sb)
-    await ex(f"cat > /tmp/s.sh <<'SFORK_EOF'\n{script.read_text()}\nSFORK_EOF", 60)
+    body = script.read_text()  # noqa: ASYNC240 (tiny local file)
+    await ex(f"cat > /tmp/s.sh <<'SFORK_EOF'\n{body}\nSFORK_EOF", 60)
     r = await ex(in_dir(task.eval.workdir, "bash /tmp/s.sh"), 900)
     print(f"[{task.name}/{label}] script exit {r.exit_code}: {r.output[-600:]}", flush=True)
     ev = await evaluate(lambda c, t: ex(c, t), task.eval, node_id="x", label=label)
