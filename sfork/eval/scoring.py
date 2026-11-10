@@ -123,16 +123,46 @@ def score(evals: Sequence[Evaluation], cfg: EvalConfig, baseline: Evaluation | N
         e.score = sum(w * e.components.get(k, 0.0) for k, w in active.items()) / wsum
 
 
+@dataclass
+class Signal:
+    """An extra correctness signal ranked right after the gates, ahead of tests and score.
+
+    Used for checks that are not part of the task's own config, e.g. reproduction tests generated
+    from the issue at selection time (see sfork.eval.repro). `values` is node id -> a rate in [0, 1];
+    `shown` is node id -> how to show it (e.g. "3/4"). Nodes without a value count as 0.
+    """
+
+    name: str
+    values: dict[str, float] = field(default_factory=dict)
+    shown: dict[str, str] = field(default_factory=dict)
+
+    def of(self, e: Evaluation) -> float:
+        return round(self.values.get(e.node_id, 0.0), 6)
+
+    def show(self, e: Evaluation) -> str:
+        return self.shown.get(e.node_id, "n/a")
+
+
 def rank(
-    evals: Sequence[Evaluation], cfg: EvalConfig, baseline: Evaluation | None = None
+    evals: Sequence[Evaluation],
+    cfg: EvalConfig,
+    baseline: Evaluation | None = None,
+    signal: Signal | None = None,
 ) -> list[Evaluation]:
     """Score, then return best first (stable: ties keep input order)."""
     score(evals, cfg, baseline)
-    return sorted(evals, key=lambda e: e.rank_key(cfg.correctness_first), reverse=True)
+
+    def key(e: Evaluation) -> tuple[float, ...]:
+        k = e.rank_key(cfg.correctness_first)
+        return (k[0], signal.of(e) if signal else 0.0, *k[1:])
+
+    return sorted(evals, key=key, reverse=True)
 
 
-def near_tie(a: Evaluation, b: Evaluation, cfg: EvalConfig) -> bool:
+def near_tie(a: Evaluation, b: Evaluation, cfg: EvalConfig, signal: Signal | None = None) -> bool:
     if not (a.gates_ok and b.gates_ok):
+        return False
+    if signal is not None and signal.of(a) != signal.of(b):
         return False
     if cfg.correctness_first and round(a.pass_rate, 6) != round(b.pass_rate, 6):
         return False
@@ -161,6 +191,7 @@ class Selection:
     deciding: str  # only | disqualified | tests | <component> | judge | tie
     baseline: Evaluation | None = None
     verdict: Verdict | None = None
+    signal: Signal | None = None
 
     @property
     def winner(self) -> Evaluation:
@@ -179,6 +210,7 @@ class Selection:
                     "score": round(e.score, 4),
                     "qualified": e.gates_ok,
                     "components": {k: round(v, 4) for k, v in e.components.items()},
+                    **({self.signal.name: self.signal.show(e)} if self.signal else {}),
                 }
                 for e in self.ranked
             ],
@@ -193,6 +225,7 @@ def explain(
     *,
     baseline: Evaluation | None = None,
     verdict: Verdict | None = None,
+    signal: Signal | None = None,
 ) -> tuple[str, str]:
     """(why, deciding factor). `why` is one paragraph a human can audit against the artifacts."""
     cfg = cfg or EvalConfig()
@@ -207,6 +240,9 @@ def explain(
         why, deciding = "no branch qualified; kept the one with the most passing tests", "disqualified"
     elif not r.gates_ok:
         why, deciding = f"{_name(r)} (runner-up) was disqualified: {_dq(r)}", "disqualified"
+    elif signal is not None and signal.of(w) > signal.of(r):
+        why = f"passes more {signal.name} checks ({signal.show(w)} vs {signal.show(r)} for {_name(r)})"
+        deciding = signal.name
     elif cfg.correctness_first and round(w.pass_rate, 6) > round(r.pass_rate, 6):
         why = f"more tests pass ({w.passed}/{w.total} vs {r.passed}/{r.total} for {_name(r)})"
         deciding = "tests"
@@ -231,6 +267,8 @@ def explain(
         out.append(f"Fork point: {baseline.summary()}.")
     for e in ranked:
         line = f"{_name(e)}: {e.summary()}"
+        if signal is not None:
+            line += f", {signal.name} {signal.show(e)}"
         if e.regressions and e.gates_ok:
             line += f" (regressed: {', '.join(_short(n) for n in e.regressions[:3])})"
         out.append(line)
@@ -289,4 +327,4 @@ def _ratio(r: float) -> str:
     return f"{1 / r:.3g}x worse"
 
 
-__all__ = ["Selection", "Verdict", "explain", "near_tie", "rank", "score"]
+__all__ = ["Selection", "Signal", "Verdict", "explain", "near_tie", "rank", "score"]
