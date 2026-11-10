@@ -6,7 +6,7 @@ At a decision point the running VM (disk, memory and processes) is forked into N
 child tries one approach, the best one is promoted and the rest are deleted. The same machinery
 gives checkpoints you can rewind to. See [PLAN.md](PLAN.md) for the full design and roadmap.
 
-**Status:** Phase 0 spike, Phase 1 tree engine, and the first end-to-end loop: a Claude agent
+**Status:** concluded. See [REPORT.md](REPORT.md) for the findings. Phase 0 spike, Phase 1 tree engine, and the first end-to-end loop: a Claude agent
 that forks its sandbox and conversation at a decision point, an evaluator that scores each branch on
 tests and benchmarks, and promotion of the winner (`sfork explore`), plus checkpoints the agent can
 rewind to when a step breaks something (`examples/billing_migration`). Phase 2's evaluator scores
